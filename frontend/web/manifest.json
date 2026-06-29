@@ -1,0 +1,12 @@
+{
+  "name": "Video Bench",
+  "short_name": "Video Bench",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#10141f",
+  "theme_color": "#10141f",
+  "description": "Review uploaded videos and video analyzer reports.",
+  "orientation": "landscape-primary",
+  "prefer_related_applications": false,
+  "icons": []
+}
