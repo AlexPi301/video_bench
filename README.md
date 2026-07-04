@@ -84,38 +84,7 @@ cd video_bench
 
 > Alternatively, use HTTPS: `git clone https://github.com/AlexPi301/video_bench.git`
 
-### 2. Prepare the entrypoint hook
-
-The production Dockerfile copies a debug-config entrypoint hook that is excluded from version control. Recreate it before the first build so the image builds cleanly:
-
-```bash
-mkdir -p docker/docker-entrypoint.d
-cat > docker/docker-entrypoint.d/40-video-bench-debug-config.sh <<'EOF'
-#!/bin/sh
-set -eu
-
-config_path="/usr/share/nginx/html/debug-config.json"
-
-if [ "${VIDEO_BENCH_DEBUG_MODE:-0}" = "1" ]; then
-  video_url="${VIDEO_BENCH_DEBUG_VIDEO_URL:-/api/mounted-files/file/?path=airport_walk/airport_walk_normal.mov}"
-  video_filename="${VIDEO_BENCH_DEBUG_VIDEO_FILENAME:-airport_walk_normal.mov}"
-  csv_url="${VIDEO_BENCH_DEBUG_CSV_URL:-/api/mounted-files/file/?path=airport_walk/report_airport_walk_normal.mov.csv}"
-  csv_filename="${VIDEO_BENCH_DEBUG_CSV_FILENAME:-report_airport_walk_normal.mov.csv}"
-  impact_source_type="${VIDEO_BENCH_DEBUG_IMPACT_SOURCE_TYPE:-mounted}"
-  impact_source_path="${VIDEO_BENCH_DEBUG_IMPACT_SOURCE_PATH:-airport_walk/airport_walk_normal.mov}"
-  agent_control="${VIDEO_BENCH_AGENT_CONTROL:-true}"
-  experimental="${VIDEO_BENCH_EXPERIMENTAL:-false}"
-  cat > "$config_path" <<EOFCFG
-{"enabled":true,"agentControl":$agent_control,"videoUrl":"$video_url","videoFilename":"$video_filename","csvUrl":"$csv_url","csvFilename":"$csv_filename","impactSourceType":"$impact_source_type","impactSourcePath":"$impact_source_path","experimental":$experimental}
-EOFCFG
-else
-  printf '{"enabled":false}\n' > "$config_path"
-fi
-EOF
-chmod +x docker/docker-entrypoint.d/40-video-bench-debug-config.sh
-```
-
-### 3. Build the Docker image
+### 2. Build the Docker image
 
 From the repository root (`video_bench/`):
 
@@ -127,7 +96,7 @@ Optional build argument:
 
 - `VIDEO_BENCH_EXPERIMENTAL=true` &mdash; enables the experimental Impact Cycle panel in the UI.
 
-### 4. Run the container
+### 3. Run the container
 
 ```bash
 docker run -d \
@@ -142,7 +111,7 @@ docker run -d \
 
 Replace `/path/to/your/input` with the host directory that contains your videos and CSV report files.
 
-### 5. Open the app
+### 4. Open the app
 
 Navigate to <http://localhost:8080/> in your browser. The container reports a health status once nginx and gunicorn are ready:
 

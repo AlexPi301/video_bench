@@ -6,4 +6,3 @@ doc/*
 **.log
 /models/sam3/**
 /backend/tests/**
-docker/docker-entrypoint.d/40-video-bench-debug-config.sh
