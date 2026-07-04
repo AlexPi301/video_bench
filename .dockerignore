@@ -11,8 +11,7 @@ frontend/build
 backend/tests/.docker-prod-debug
 backend/tests/video_bench_prod.log
 backend/tests/debug
-backend/IMPACT_CYCLE/.git
-backend/IMPACT_CYCLE/**/*.pdf
+backend/IMPACT_CYCLE
 models
 **/*.md
 **/*.mov

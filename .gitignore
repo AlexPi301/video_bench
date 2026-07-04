@@ -6,3 +6,4 @@ doc/*
 **.log
 /models/sam3/**
 /backend/tests/**
+/backend/IMPACT_CYCLE/**

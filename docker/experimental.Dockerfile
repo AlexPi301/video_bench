@@ -1,4 +1,4 @@
-# Production image for Video Bench Flutter web frontend, Django backend, and nginx.
+# Production image, but includes impact_cycle dependencies so impact_cycle backend can run properly.
 # syntax=docker/dockerfile:1.7
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -88,6 +88,13 @@ COPY ${APP_DIR}/docker/docker-entrypoint.d/40-video-bench-debug-config.sh /docke
 COPY ${APP_DIR}/docker/entrypoint.sh /entrypoint.sh
 COPY --chown=app:app ${APP_DIR}/backend/manage.py /app/backend/manage.py
 COPY --chown=app:app ${APP_DIR}/backend/video_bench_backend /app/backend/video_bench_backend
+COPY --chown=app:app ${APP_DIR}/backend/IMPACT_CYCLE/configs /app/backend/IMPACT_CYCLE/configs
+COPY --chown=app:app ${APP_DIR}/backend/IMPACT_CYCLE/core /app/backend/IMPACT_CYCLE/core
+COPY --chown=app:app ${APP_DIR}/backend/IMPACT_CYCLE/tools /app/backend/IMPACT_CYCLE/tools
+COPY --chown=app:app ${APP_DIR}/backend/IMPACT_CYCLE/utils /app/backend/IMPACT_CYCLE/utils
+COPY --chown=app:app ${APP_DIR}/backend/IMPACT_CYCLE/tmp/sg_prompts_dump.txt /app/backend/IMPACT_CYCLE/tmp/sg_prompts_dump.txt
+COPY --chown=app:app ${APP_DIR}/backend/IMPACT_CYCLE/feature_defaults.json /app/backend/IMPACT_CYCLE/feature_defaults.json
+COPY --chown=app:app ${APP_DIR}/backend/IMPACT_CYCLE/runner_envs.json /app/backend/IMPACT_CYCLE/runner_envs.json
 COPY --from=flutter-builder /app/frontend/build/web /usr/share/nginx/html
 RUN mkdir -p /data /data/impact-cycle \
     && chown -R app:app /data /app/backend \
