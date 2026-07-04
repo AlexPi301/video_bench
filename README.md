@@ -186,7 +186,3 @@ video_bench/
 |   `-- entrypoint.sh
 `-- README.md
 ```
-
-## License
-
-This project is released under the Apache License 2.0. See the `IMPACT_CYCLE/LICENSE` file for the license of the integrated scene-graph engine. Please also review the terms of use of any external models and datasets you connect (SAM3 checkpoints, Qwen, LM Studio models, VidOR/PVSG, etc.).
