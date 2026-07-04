@@ -1,3 +1,4 @@
+/*
 name: Publish Docker Image
 
 on:
@@ -50,3 +51,4 @@ jobs:
             VIDEO_BENCH_EXPERIMENTAL=false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+*/
