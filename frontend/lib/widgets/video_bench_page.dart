@@ -57,6 +57,7 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
   bool? _captionsFound;
   final Set<String> _hiddenCategoryKeys = {};
   final Set<String> _hiddenAnnotationTypeKeys = {};
+  var _annotationDialogOpen = false;
 
   List<VideoPointOfInterest> get _pointsOfInterest =>
       _report?.pointsOfInterest ?? const [];
@@ -807,8 +808,9 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
       return;
     }
 
+    _annotationDialogOpen = true;
     _videoController.setInteractionBlocked(true);
-    final result = await showDialog<_AnnotationDialogResult>(
+    await showDialog<_AnnotationDialogResult>(
       context: context,
       barrierDismissible: false,
       builder: (context) => _AnnotationDialog(
@@ -818,29 +820,19 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
         nextId: _nextAnnotationId(),
         duration: _videoController.duration,
         annotations: _annotations,
+        onSave: _saveAnnotationFromDialog,
       ),
     ).whenComplete(() {
+      _annotationDialogOpen = false;
       _videoController.setInteractionBlocked(false);
     });
-
-    if (result == null || !mounted || result.annotation == null) {
-      return;
-    }
-
-    final annotation = result.annotation!;
-    final dataset = (_annotationDataset ?? _newAnnotationDataset()).add(annotation);
-    setState(() {
-      _annotationDataset = dataset;
-      _syncFilteredTimelineData();
-      _statusMessage = 'Added annotation ${annotation.id} at ${formatVideoTimestamp(annotation.timestamp)}.';
-    });
-    await _persistAnnotationDataset();
   }
 
   Future<void> _openExistingAnnotationDialog(BenchmarkAnnotation annotation) async {
     _videoController.seekTo(annotation.timestamp);
     _videoController.pause();
 
+    _annotationDialogOpen = true;
     _videoController.setInteractionBlocked(true);
     final result = await showDialog<_AnnotationDialogResult>(
       context: context,
@@ -853,8 +845,10 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
         duration: _videoController.duration,
         annotations: _annotations,
         annotation: annotation,
+        onSave: _saveAnnotationFromDialog,
       ),
     ).whenComplete(() {
+      _annotationDialogOpen = false;
       _videoController.setInteractionBlocked(false);
     });
 
@@ -874,16 +868,26 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
       return;
     }
 
-    final updated = result.annotation;
-    if (updated == null) {
-      return;
-    }
+  }
 
-    final dataset = currentDataset.replace(updated);
+  Future<void> _saveAnnotationFromDialog(BenchmarkAnnotation annotation, String? previousId) async {
+    final currentDataset = _annotationDataset ?? _newAnnotationDataset();
+    final replaceId = previousId ?? annotation.id;
+    final exists = currentDataset.qaPairs.any((pair) => pair.id == replaceId);
+    final withoutPrevious = previousId != null && previousId != annotation.id
+        ? currentDataset.delete(previousId)
+        : currentDataset;
+    final dataset = exists
+        ? previousId != null && previousId != annotation.id
+            ? withoutPrevious.add(annotation)
+            : withoutPrevious.replace(annotation)
+        : withoutPrevious.add(annotation);
     setState(() {
       _annotationDataset = dataset;
       _syncFilteredTimelineData();
-      _statusMessage = 'Updated annotation ${updated.id}.';
+      _statusMessage = exists
+          ? 'Updated annotation ${annotation.id}.'
+          : 'Added annotation ${annotation.id} at ${formatVideoTimestamp(annotation.timestamp)}.';
     });
     await _persistAnnotationDataset();
   }
@@ -1165,6 +1169,9 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
   }
 
   void _handleBrowserKeyDown(html.KeyboardEvent event) {
+    if (_annotationDialogOpen) {
+      return;
+    }
     if (_isTextInputFocused()) {
       return;
     }
@@ -1176,12 +1183,12 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
     }
     if (event.code == 'ArrowLeft') {
       event.preventDefault();
-      _seekRelative(const Duration(seconds: -10));
+      _seekRelative(const Duration(milliseconds: -500));
       return;
     }
     if (event.code == 'ArrowRight') {
       event.preventDefault();
-      _seekRelative(const Duration(seconds: 10));
+      _seekRelative(const Duration(milliseconds: 500));
       return;
     }
     if (event.code == 'KeyA') {
@@ -2917,10 +2924,8 @@ class _TimelineListItem {
 }
 
 class _AnnotationDialogResult {
-  const _AnnotationDialogResult.save(this.annotation) : deleteId = null;
-  const _AnnotationDialogResult.delete(this.deleteId) : annotation = null;
+  const _AnnotationDialogResult.delete(this.deleteId);
 
-  final BenchmarkAnnotation? annotation;
   final String? deleteId;
 }
 
@@ -3013,6 +3018,7 @@ class _MultipleChoiceEditor extends StatelessWidget {
 
 class _EvidenceVideoPreview extends StatefulWidget {
   const _EvidenceVideoPreview({
+    super.key,
     required this.videoUrl,
     required this.startSeconds,
     required this.endSeconds,
@@ -3157,6 +3163,17 @@ class _EvidenceVideoPreviewState extends State<_EvidenceVideoPreview> {
     if (mounted) {
       setState(() {});
     }
+  }
+
+  void _seekRelative(double offsetSeconds) {
+    if (!_hasUsableRange) {
+      return;
+    }
+    final start = widget.startSeconds ?? 0;
+    final end = _effectiveEndSeconds ?? start;
+    final target = (_video.currentTime + offsetSeconds).clamp(start, end).toDouble();
+    _video.currentTime = target;
+    setState(() => _currentSeconds = target);
   }
 
   void _handleTimeUpdate() {
@@ -3345,6 +3362,7 @@ class _AnnotationDialog extends StatefulWidget {
     required this.nextId,
     required this.duration,
     required this.annotations,
+    required this.onSave,
     this.annotation,
   });
 
@@ -3354,6 +3372,7 @@ class _AnnotationDialog extends StatefulWidget {
   final String nextId;
   final Duration duration;
   final List<BenchmarkAnnotation> annotations;
+  final Future<void> Function(BenchmarkAnnotation annotation, String? previousId) onSave;
   final BenchmarkAnnotation? annotation;
 
   @override
@@ -3362,6 +3381,8 @@ class _AnnotationDialog extends StatefulWidget {
 
 class _AnnotationDialogState extends State<_AnnotationDialog> {
   final _formKey = GlobalKey<FormState>();
+  final _previewKey = GlobalKey<_EvidenceVideoPreviewState>();
+  StreamSubscription<html.KeyboardEvent>? _keyboardSubscription;
   late final TextEditingController _idController;
   late final TextEditingController _videoIdController;
   late final TextEditingController _questionController;
@@ -3381,7 +3402,9 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
   var _unanswerable = false;
   late List<BenchmarkAnnotation> _chronologicalAnnotations;
   BenchmarkAnnotation? _activeAnnotation;
+  BenchmarkAnnotation? _savedAnnotationSnapshot;
   var _loadingAnnotation = false;
+  var _saving = false;
 
   bool get _isEditing => _activeAnnotation != null;
   bool get _isMultipleChoice => _answerFormat == 'multiple_choice';
@@ -3421,12 +3444,34 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
     _startSecondsController.addListener(_handleEvidenceRangeChanged);
     _endSecondsController.addListener(_handleEvidenceRangeChanged);
     _evidenceDescriptionController = TextEditingController();
+    for (final controller in [
+      _idController,
+      _videoIdController,
+      _questionController,
+      _answerController,
+      _aliasesController,
+      _evidenceDescriptionController,
+    ]) {
+      controller.addListener(_handleFormChanged);
+    }
+    _keyboardSubscription = html.window.onKeyDown.listen(_handleDialogKeyDown);
     _loadAnnotationIntoForm(_activeAnnotation);
   }
 
   @override
   void dispose() {
+    _keyboardSubscription?.cancel();
     _startSecondsController.removeListener(_handleEvidenceRangeChanged);
+    for (final controller in [
+      _idController,
+      _videoIdController,
+      _questionController,
+      _answerController,
+      _aliasesController,
+      _evidenceDescriptionController,
+    ]) {
+      controller.removeListener(_handleFormChanged);
+    }
     _endSecondsController.removeListener(_handleEvidenceRangeChanged);
     _idController.dispose();
     _videoIdController.dispose();
@@ -3437,7 +3482,7 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
     _endSecondsController.dispose();
     _evidenceDescriptionController.dispose();
     for (final controller in _choiceControllers) {
-      controller.dispose();
+      _disposeChoiceController(controller);
     }
     super.dispose();
   }
@@ -3451,6 +3496,70 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
     }
   }
 
+  void _handleFormChanged() {
+    if (_loadingAnnotation || !mounted) {
+      return;
+    }
+    setState(() {});
+  }
+
+  void _handleDialogKeyDown(html.KeyboardEvent event) {
+    if (_isDialogTextInputFocused()) {
+      return;
+    }
+    if (event.code == 'KeyD') {
+      event.preventDefault();
+      if (_canNavigatePrevious) {
+        _navigateToAnnotation(-1);
+      }
+      return;
+    }
+    if (event.code == 'KeyF') {
+      event.preventDefault();
+      if (_canNavigateNext) {
+        _navigateToAnnotation(1);
+      }
+      return;
+    }
+    if (event.code == 'KeyS') {
+      event.preventDefault();
+      if (_canSave) {
+        unawaited(_save());
+      }
+      return;
+    }
+    if (event.code == 'Space') {
+      event.preventDefault();
+      final preview = _previewKey.currentState;
+      if (preview != null) {
+        unawaited(preview._togglePlayback());
+      }
+      return;
+    }
+    if (event.code == 'ArrowLeft') {
+      event.preventDefault();
+      _seekEvidenceRelative(-0.5);
+      return;
+    }
+    if (event.code == 'ArrowRight') {
+      event.preventDefault();
+      _seekEvidenceRelative(0.5);
+    }
+  }
+
+  bool _isDialogTextInputFocused() {
+    final element = html.document.activeElement;
+    final tagName = element?.tagName.toLowerCase();
+    return tagName == 'input' ||
+        tagName == 'textarea' ||
+        tagName == 'select' ||
+        element?.isContentEditable == true;
+  }
+
+  void _seekEvidenceRelative(double offsetSeconds) {
+    _previewKey.currentState?._seekRelative(offsetSeconds);
+  }
+
   void _loadAnnotationIntoForm(BenchmarkAnnotation? annotation) {
     _loadingAnnotation = true;
     final span = annotation?.evidenceSpans.isNotEmpty == true
@@ -3458,7 +3567,7 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
         : null;
     final seconds = _secondsText(widget.timestamp);
     for (final controller in _choiceControllers) {
-      controller.dispose();
+      _disposeChoiceController(controller);
     }
     _choiceControllers.clear();
     _idController.text = annotation?.id ?? widget.nextId;
@@ -3477,10 +3586,11 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
     _selectedReasoningTypes = annotation == null ? <String>{'perception'} : annotation.reasoningTypes.toSet();
     _unanswerable = annotation?.unanswerable ?? false;
     for (final choice in annotation?.choices ?? const <String>[]) {
-      _choiceControllers.add(TextEditingController(text: choice));
+      _choiceControllers.add(_newChoiceController(text: choice));
     }
     _selectedCorrectChoices = _parseCorrectChoices(annotation?.answer).toSet();
     _syncMultipleChoiceAnswer();
+    _savedAnnotationSnapshot = _annotationFromForm();
     _loadingAnnotation = false;
   }
 
@@ -3497,6 +3607,63 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
       _activeAnnotation = _chronologicalAnnotations[nextIndex];
       _loadAnnotationIntoForm(_activeAnnotation);
     });
+  }
+
+  TextEditingController _newChoiceController({String text = ''}) {
+    final controller = TextEditingController(text: text);
+    controller.addListener(_handleFormChanged);
+    return controller;
+  }
+
+  void _disposeChoiceController(TextEditingController controller) {
+    controller.removeListener(_handleFormChanged);
+    controller.dispose();
+  }
+
+  bool get _canSave => !_saving && _hasFormUpdates;
+
+  bool get _hasFormUpdates {
+    final current = _annotationFromForm();
+    final saved = _savedAnnotationSnapshot;
+    if (current == null || saved == null) {
+      return false;
+    }
+    return !_annotationsEqual(current, saved);
+  }
+
+  BenchmarkAnnotation? _annotationFromForm() {
+    final start = double.tryParse(_startSecondsController.text.trim());
+    final end = double.tryParse(_endSecondsController.text.trim());
+    if (start == null || end == null) {
+      return null;
+    }
+    return BenchmarkAnnotation(
+      id: _idController.text.trim(),
+      videoId: _videoIdController.text.trim(),
+      question: _questionController.text.trim(),
+      answer: _unanswerable ? null : _parseAnswer(_answerController.text.trim()),
+      answerFormat: _answerFormat,
+      family: _family,
+      reasoningTypes: _selectedReasoningTypes.toList()..sort(),
+      difficulty: _difficulty,
+      visibility: _visibility,
+      dayNight: _dayNight,
+      evidenceSpans: [
+        EvidenceSpan(
+          startSeconds: start,
+          endSeconds: end,
+          description: _emptyToNull(_evidenceDescriptionController.text),
+        ),
+      ],
+      trajectoryLinkage: null,
+      choices: _isMultipleChoice ? _choiceTexts() : const [],
+      answerAliases: _csvList(_aliasesController.text),
+      unanswerable: _unanswerable,
+    );
+  }
+
+  bool _annotationsEqual(BenchmarkAnnotation left, BenchmarkAnnotation right) {
+    return jsonEncode(left.toJson()) == jsonEncode(right.toJson());
   }
 
   double? get _previewStartSeconds => double.tryParse(_startSecondsController.text.trim());
@@ -3528,17 +3695,19 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
                 child: LayoutBuilder(
                   builder: (context, constraints) {
                     final compact = constraints.maxWidth < 980;
-                    final preview = SizedBox(
-                      width: compact ? double.infinity : 560,
-                      height: compact ? 340 : null,
-                      child: _EvidenceVideoPreview(
+                    final preview = _EvidenceVideoPreview(
+                        key: _previewKey,
                         videoUrl: widget.videoUrl,
                         startSeconds: startSeconds,
                         endSeconds: endSeconds,
                         duration: widget.duration,
                         onPreviousQa: _canNavigatePrevious ? () => _navigateToAnnotation(-1) : null,
                         onNextQa: _canNavigateNext ? () => _navigateToAnnotation(1) : null,
-                      ),
+                      );
+                    final compactPreview = SizedBox(
+                      width: double.infinity,
+                      height: 340,
+                      child: preview,
                     );
                     final form = Expanded(
                       child: Form(
@@ -3656,7 +3825,7 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
                     if (compact) {
                       return Column(
                         children: [
-                          preview,
+                          compactPreview,
                           const SizedBox(height: 20),
                           form,
                         ],
@@ -3666,7 +3835,7 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
                     return Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        preview,
+                        Expanded(child: preview),
                         const SizedBox(width: 20),
                         form,
                       ],
@@ -3702,11 +3871,16 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
                   Semantics(
                     identifier: 'annotation-dialog.save',
                     button: true,
+                    enabled: _canSave,
                     label: _isEditing ? 'Save changes' : 'Save annotation',
                     child: FilledButton.icon(
-                      onPressed: _save,
+                      onPressed: _canSave ? _save : null,
                       icon: const Icon(Icons.save),
-                      label: Text(_isEditing ? 'Save changes' : 'Save annotation'),
+                      label: Text(_saving
+                          ? 'Saving...'
+                          : _isEditing
+                              ? 'Save changes'
+                              : 'Save annotation'),
                     ),
                   ),
                 ],
@@ -3795,7 +3969,10 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
         .replaceAll(RegExp(r'^-+|-+$'), '');
   }
 
-  void _save() {
+  Future<void> _save() async {
+    if (!_canSave) {
+      return;
+    }
     if (!_formKey.currentState!.validate()) {
       return;
     }
@@ -3843,29 +4020,48 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
       return;
     }
 
-    Navigator.of(context).pop(_AnnotationDialogResult.save(BenchmarkAnnotation(
-      id: _idController.text.trim(),
-      videoId: _videoIdController.text.trim(),
-      question: _questionController.text.trim(),
-      answer: _unanswerable ? null : _parseAnswer(_answerController.text.trim()),
-      answerFormat: _answerFormat,
-      family: _family,
-      reasoningTypes: _selectedReasoningTypes.toList()..sort(),
-      difficulty: _difficulty,
-      visibility: _visibility,
-      dayNight: _dayNight,
-      evidenceSpans: [
-        EvidenceSpan(
-          startSeconds: start,
-          endSeconds: end,
-          description: _emptyToNull(_evidenceDescriptionController.text),
-        ),
-      ],
-      trajectoryLinkage: null,
-      choices: _isMultipleChoice ? _choiceTexts() : const [],
-      answerAliases: _csvList(_aliasesController.text),
-      unanswerable: _unanswerable,
-    )));
+    final annotation = _annotationFromForm();
+    if (annotation == null) {
+      return;
+    }
+
+    final previousId = _activeAnnotation?.id;
+    setState(() => _saving = true);
+    try {
+      await widget.onSave(annotation, previousId);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _activeAnnotation = annotation;
+        final index = _chronologicalAnnotations.indexWhere((item) => item.id == (previousId ?? annotation.id));
+        if (index >= 0) {
+          _chronologicalAnnotations[index] = annotation;
+        } else {
+          _chronologicalAnnotations.add(annotation);
+        }
+        _chronologicalAnnotations.sort((a, b) {
+          final timeCompare = a.timestamp.compareTo(b.timestamp);
+          if (timeCompare != 0) {
+            return timeCompare;
+          }
+          return a.id.compareTo(b.id);
+        });
+        _savedAnnotationSnapshot = annotation;
+        _saving = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Saved annotation ${annotation.id}.')),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _saving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not save annotation: $error')),
+      );
+    }
   }
 
   void _delete() {
@@ -3901,14 +4097,14 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
       return;
     }
     setState(() {
-      _choiceControllers.add(TextEditingController());
+      _choiceControllers.add(_newChoiceController());
       _syncMultipleChoiceAnswer();
     });
   }
 
   void _deleteChoice(int index) {
     setState(() {
-      _choiceControllers.removeAt(index).dispose();
+      _disposeChoiceController(_choiceControllers.removeAt(index));
       _selectedCorrectChoices = {
         for (final selected in _selectedCorrectChoices)
           if (selected != index + 1)
