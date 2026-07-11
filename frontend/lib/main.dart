@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 
 import 'services/devtools_agent_bridge.dart';
+import 'widgets/benchmarks_page.dart';
 import 'widgets/impact_cycle_page.dart';
 import 'widgets/video_bench_page.dart';
 
@@ -79,6 +80,12 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
         title: const Text('Video Bench'),
         actions: [
           _NavButton(
+            identifier: 'app.nav.benchmarks',
+            label: 'Benchmarks',
+            selected: _selectedIndex == 1,
+            onPressed: () => _selectPage(1),
+          ),
+          _NavButton(
             identifier: 'app.nav.video-bench',
             label: 'Video Bench',
             selected: _selectedIndex == 0,
@@ -88,8 +95,8 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
             _NavButton(
               identifier: 'app.nav.impact-cycle',
               label: 'Impact Cycle',
-              selected: _selectedIndex == 1,
-              onPressed: () => _selectPage(1),
+              selected: _selectedIndex == 2,
+              onPressed: () => _selectPage(2),
             ),
           const SizedBox(width: 12),
         ],
@@ -98,6 +105,7 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
         index: _selectedIndex,
         children: const [
           VideoBenchPage(),
+          BenchmarksPage(),
           if (_experimentalEnabled) ImpactCyclePage(),
         ],
       ),
@@ -112,7 +120,7 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
   void _registerAgentHooks() {
     final bridge = DevtoolsAgentBridge.instance;
     bridge.registerStateProvider(this, 'app', () => {
-          'selectedPage': _selectedIndex == 1 ? 'impactCycle' : 'videoBench',
+          'selectedPage': _selectedPageName,
           'experimentalEnabled': _experimentalEnabled,
         });
     bridge.registerCommand(this, 'app.selectPage', (args) {
@@ -121,14 +129,26 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
         if (!_experimentalEnabled) {
           throw StateError('Impact Cycle is not enabled in this build.');
         }
+        _selectPage(2);
+      } else if (page == 'benchmarks') {
         _selectPage(1);
       } else if (page == 'videoBench') {
         _selectPage(0);
       } else {
-        throw ArgumentError('Expected page to be "videoBench" or "impactCycle".');
+        throw ArgumentError('Expected page to be "videoBench", "benchmarks", or "impactCycle".');
       }
       return bridge.state;
     });
+  }
+
+  String get _selectedPageName {
+    if (_selectedIndex == 1) {
+      return 'benchmarks';
+    }
+    if (_selectedIndex == 2) {
+      return 'impactCycle';
+    }
+    return 'videoBench';
   }
 }
 
