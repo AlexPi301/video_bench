@@ -1252,6 +1252,7 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
     fps_sampling = max(1, int(settings_payload.get("fpsSampling", 3) or 3))
     window_size = max(1, int(settings_payload.get("windowSizeSeconds", 25) or 25))
     qa_pairs_per_window = max(1, int(settings_payload.get("qaPairsPerWindow", 10) or 10))
+    skip_invalid_qa_pairs = bool(settings_payload.get("skipInvalidQaPairs", False))
     qa_prompt = str(settings_payload.get("qaGenerationPrompt") or "").strip()
     if not qa_prompt:
         raise RuntimeError("QA generation prompt is required.")
@@ -1303,9 +1304,10 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
             expected_families = [QA_CORE_FAMILIES[(sequence_index + offset) % len(QA_CORE_FAMILIES)] for offset in range(qa_pairs_per_window)]
             expected_formats = [QA_ALLOWED_ANSWER_FORMATS[(sequence_index + offset) % len(QA_ALLOWED_ANSWER_FORMATS)] for offset in range(qa_pairs_per_window)]
             retry_feedback = ""
-            generated: list[dict[str, Any]] | None = None
+            generated: list[tuple[int, dict[str, Any]]] | None = None
             last_error = ""
-            for attempt in range(1, QA_PAIR_RETRY_ATTEMPTS + 1):
+            max_attempts = 1 if skip_invalid_qa_pairs else QA_PAIR_RETRY_ATTEMPTS
+            for attempt in range(1, max_attempts + 1):
                 prompt = _qa_pairs_prompt(
                     base_prompt=qa_prompt,
                     video_rel=video_rel,
@@ -1319,7 +1321,7 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
                     previous_pairs=qa_pairs[-10:],
                     retry_feedback=retry_feedback,
                 )
-                _append_event(job, "qa_window", f"Requesting QA pairs for window {window_index + 1}/{total_windows}, attempt {attempt}/{QA_PAIR_RETRY_ATTEMPTS}.")
+                _append_event(job, "qa_window", f"Requesting QA pairs for window {window_index + 1}/{total_windows}, attempt {attempt}/{max_attempts}.")
                 _append_qa_generation_log(
                     log_path,
                     event="attempt",
@@ -1346,34 +1348,55 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
                         raise RuntimeError(f"LM Studio returned an empty QA completion ({_litellm_empty_completion_details(response)}).")
                     payload = _parse_qa_pairs_completion(raw_text)
                     candidate_pairs = _extract_qa_pair_list(payload)
-                    _validate_generated_qa_pairs(
-                        candidate_pairs,
-                        qa_pairs_per_window=qa_pairs_per_window,
-                        expected_families=expected_families,
-                        expected_formats=expected_formats,
-                        start_seconds=start_seconds,
-                        end_seconds=end_seconds,
-                    )
-                    generated = candidate_pairs
+                    if skip_invalid_qa_pairs:
+                        generated = _valid_generated_qa_pairs(
+                            candidate_pairs,
+                            expected_families=expected_families,
+                            expected_formats=expected_formats,
+                            start_seconds=start_seconds,
+                            end_seconds=end_seconds,
+                            log_path=log_path,
+                            job_id=job_id,
+                            video_rel=video_rel,
+                            window_index=window_index,
+                            attempt=attempt,
+                        )
+                    else:
+                        _validate_generated_qa_pairs(
+                            candidate_pairs,
+                            qa_pairs_per_window=qa_pairs_per_window,
+                            expected_families=expected_families,
+                            expected_formats=expected_formats,
+                            start_seconds=start_seconds,
+                            end_seconds=end_seconds,
+                        )
+                        generated = list(enumerate(candidate_pairs))
                     break
                 except Exception as exc:
                     last_error = str(exc)
                     retry_feedback = f"Previous response was invalid: {last_error}. Fix this exactly and return only valid JSON."
-                    _append_event(job, "qa_retry", f"QA validation failed for window {window_index + 1}/{total_windows}: {last_error[:300]}", attempt=attempt)
+                    retry_event = "qa_skipped" if skip_invalid_qa_pairs else "qa_retry"
+                    retry_message = "QA response could not be parsed" if skip_invalid_qa_pairs else "QA validation failed"
+                    _append_event(job, retry_event, f"{retry_message} for window {window_index + 1}/{total_windows}: {last_error[:300]}", attempt=attempt)
                     _append_qa_generation_log(
                         log_path,
-                        event="retry",
+                        event="skipped_window" if skip_invalid_qa_pairs else "retry",
                         job_id=job_id,
                         video_rel=video_rel,
                         window_index=window_index,
                         start_seconds=start_seconds,
                         end_seconds=end_seconds,
                         attempt=attempt,
-                        message=f"QA validation failed for window {window_index + 1}/{total_windows}.",
+                        message=f"{retry_message} for window {window_index + 1}/{total_windows}.",
                         error=last_error,
                     )
                     _record_lm_studio_failure_if_connection(last_error, job_id)
             if generated is None:
+                if skip_invalid_qa_pairs:
+                    percent = round((window_index + 1) * 100 / max(1, total_windows))
+                    job = _update_job(job_id, progress={"processedFrames": window_index + 1, "totalFrames": total_windows, "percent": percent})
+                    _append_event(job, "qa_window_done", f"Skipped QA pairs for window {window_index + 1}/{total_windows} because the response was invalid.", percent=percent)
+                    continue
                 _append_qa_generation_log(
                     log_path,
                     event="failed",
@@ -1387,7 +1410,8 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
                 )
                 raise RuntimeError(f"QA-pair generation failed for window {window_index + 1}/{total_windows} after {QA_PAIR_RETRY_ATTEMPTS} attempts: {last_error}")
 
-            for offset, item in enumerate(generated):
+            generated_count = 0
+            for offset, item in generated:
                 normalized = _normalize_generated_qa_pair(
                     item,
                     video_id=video_path.stem,
@@ -1400,6 +1424,7 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
                     end_frame=frame_indices[-1],
                 )
                 next_qa_pair_id += 1
+                generated_count += 1
                 qa_pairs.append(normalized)
                 _append_qa_generation_log(
                     log_path,
@@ -1414,7 +1439,7 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
             _write_json_atomic(out_path, _qa_pairs_output_payload(existing_payload, video_path, video_rel, qa_pairs))
             percent = round((window_index + 1) * 100 / max(1, total_windows))
             job = _update_job(job_id, progress={"processedFrames": window_index + 1, "totalFrames": total_windows, "percent": percent})
-            _append_event(job, "qa_window_done", f"Generated {len(generated)} QA pair(s) for window {window_index + 1}/{total_windows}.", percent=percent)
+            _append_event(job, "qa_window_done", f"Generated {generated_count} QA pair(s) for window {window_index + 1}/{total_windows}.", percent=percent)
 
         _complete_workflow_job(job_id, "QA-pair generation completed.", [{"type": "qa_pairs", "name": "qa_pairs.json", "path": str(out_path)}])
     finally:
@@ -1518,43 +1543,110 @@ def _validate_generated_qa_pairs(
         raise RuntimeError(f"Expected exactly {qa_pairs_per_window} qa_pairs, got {len(pairs)}.")
     questions: set[str] = set()
     for index, item in enumerate(pairs):
-        question = str(item.get("question") or "").strip()
-        if not question:
-            raise RuntimeError(f"QA pair {index + 1} is missing a question.")
-        question_key = question.lower()
-        if question_key in questions:
-            raise RuntimeError(f"QA pair {index + 1} repeats a question in the same window.")
-        questions.add(question_key)
-        family = str(item.get("family") or "").strip()
-        if family != expected_families[index]:
-            raise RuntimeError(f"QA pair {index + 1} has family {family!r}, expected {expected_families[index]!r}.")
-        answer_format = str(item.get("answer_format") or "").strip()
-        if answer_format != expected_formats[index]:
-            raise RuntimeError(f"QA pair {index + 1} has answer_format {answer_format!r}, expected {expected_formats[index]!r}.")
-        if answer_format == "multiple_choice":
-            choices = list(item.get("choices") or [])
-            if not choices or not all(isinstance(choice, str) and choice.strip() for choice in choices):
-                raise RuntimeError(f"QA pair {index + 1} multiple_choice requires non-empty string choices.")
-            if _matching_multiple_choice_answer_index(item.get("answer"), choices) is None:
-                raise RuntimeError(f"QA pair {index + 1} multiple_choice answer must be one of choices.")
-        elif answer_format == "yes_no":
-            if not isinstance(item.get("answer"), bool):
-                raise RuntimeError(f"QA pair {index + 1} yes_no answer must be boolean.")
-        elif answer_format == "numeric":
-            if not isinstance(item.get("answer"), (int, float)) or isinstance(item.get("answer"), bool):
-                raise RuntimeError(f"QA pair {index + 1} numeric answer must be a number.")
-        else:
-            raise RuntimeError(f"QA pair {index + 1} uses unsupported answer_format {answer_format!r}.")
-        spans = list(item.get("evidence_spans") or [])
-        if not spans or not all(isinstance(span, dict) for span in spans):
-            raise RuntimeError(f"QA pair {index + 1} requires evidence_spans.")
-        for span in spans:
-            span_start = float(span.get("start_seconds") or 0)
-            span_end = float(span.get("end_seconds") if span.get("end_seconds") is not None else span_start)
-            if span_start < start_seconds - 0.001 or span_end > end_seconds + 0.001 or span_end < span_start:
-                raise RuntimeError(f"QA pair {index + 1} evidence span must stay inside the current window.")
-        if bool(item.get("unanswerable", False)):
-            raise RuntimeError(f"QA pair {index + 1} must be answerable with a valid answer.")
+        _validate_generated_qa_pair(
+            item,
+            index=index,
+            questions=questions,
+            expected_family=expected_families[index],
+            expected_format=expected_formats[index],
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+
+
+def _valid_generated_qa_pairs(
+    pairs: list[dict[str, Any]],
+    *,
+    expected_families: list[str],
+    expected_formats: list[str],
+    start_seconds: float,
+    end_seconds: float,
+    log_path: Path,
+    job_id: str,
+    video_rel: str,
+    window_index: int,
+    attempt: int,
+) -> list[tuple[int, dict[str, Any]]]:
+    valid: list[tuple[int, dict[str, Any]]] = []
+    questions: set[str] = set()
+    for index, item in enumerate(pairs):
+        try:
+            if index >= len(expected_families) or index >= len(expected_formats):
+                raise RuntimeError(f"QA pair {index + 1} was not requested for this window.")
+            _validate_generated_qa_pair(
+                item,
+                index=index,
+                questions=questions,
+                expected_family=expected_families[index],
+                expected_format=expected_formats[index],
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+            )
+        except Exception as exc:
+            _append_qa_generation_log(
+                log_path,
+                event="skipped",
+                job_id=job_id,
+                video_rel=video_rel,
+                window_index=window_index,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                attempt=attempt,
+                message=f"Skipped invalid QA pair {index + 1}.",
+                error=str(exc),
+            )
+            continue
+        valid.append((index, item))
+    return valid
+
+
+def _validate_generated_qa_pair(
+    item: dict[str, Any],
+    *,
+    index: int,
+    questions: set[str],
+    expected_family: str,
+    expected_format: str,
+    start_seconds: float,
+    end_seconds: float,
+) -> None:
+    question = str(item.get("question") or "").strip()
+    if not question:
+        raise RuntimeError(f"QA pair {index + 1} is missing a question.")
+    question_key = question.lower()
+    if question_key in questions:
+        raise RuntimeError(f"QA pair {index + 1} repeats a question in the same window.")
+    family = str(item.get("family") or "").strip()
+    if family != expected_family:
+        raise RuntimeError(f"QA pair {index + 1} has family {family!r}, expected {expected_family!r}.")
+    answer_format = str(item.get("answer_format") or "").strip()
+    if answer_format != expected_format:
+        raise RuntimeError(f"QA pair {index + 1} has answer_format {answer_format!r}, expected {expected_format!r}.")
+    if answer_format == "multiple_choice":
+        choices = list(item.get("choices") or [])
+        if not choices or not all(isinstance(choice, str) and choice.strip() for choice in choices):
+            raise RuntimeError(f"QA pair {index + 1} multiple_choice requires non-empty string choices.")
+        if _matching_multiple_choice_answer_index(item.get("answer"), choices) is None:
+            raise RuntimeError(f"QA pair {index + 1} multiple_choice answer must be one of choices.")
+    elif answer_format == "yes_no":
+        if not isinstance(item.get("answer"), bool):
+            raise RuntimeError(f"QA pair {index + 1} yes_no answer must be boolean.")
+    elif answer_format == "numeric":
+        if not isinstance(item.get("answer"), (int, float)) or isinstance(item.get("answer"), bool):
+            raise RuntimeError(f"QA pair {index + 1} numeric answer must be a number.")
+    else:
+        raise RuntimeError(f"QA pair {index + 1} uses unsupported answer_format {answer_format!r}.")
+    spans = list(item.get("evidence_spans") or [])
+    if not spans or not all(isinstance(span, dict) for span in spans):
+        raise RuntimeError(f"QA pair {index + 1} requires evidence_spans.")
+    for span in spans:
+        span_start = float(span.get("start_seconds") or 0)
+        span_end = float(span.get("end_seconds") if span.get("end_seconds") is not None else span_start)
+        if span_start < start_seconds - 0.001 or span_end > end_seconds + 0.001 or span_end < span_start:
+            raise RuntimeError(f"QA pair {index + 1} evidence span must stay inside the current window.")
+    if bool(item.get("unanswerable", False)):
+        raise RuntimeError(f"QA pair {index + 1} must be answerable with a valid answer.")
+    questions.add(question_key)
 
 
 def _normalize_generated_qa_pair(

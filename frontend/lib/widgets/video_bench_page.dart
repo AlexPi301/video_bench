@@ -681,6 +681,7 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
               'fpsSampling': result.fpsSampling,
               'windowSizeSeconds': result.windowSizeSeconds,
               'qaPairsPerWindow': result.qaPairsPerWindow,
+              'skipInvalidQaPairs': result.skipInvalidQaPairs,
               'qaGenerationPrompt': result.qaGenerationPrompt,
               'outputDirectory': outputDirectory,
               'directOutput': true,
@@ -1915,6 +1916,7 @@ class _QaPairsGenerationParams {
     required this.fpsSampling,
     required this.windowSizeSeconds,
     required this.qaPairsPerWindow,
+    required this.skipInvalidQaPairs,
     required this.qaGenerationPrompt,
   });
 
@@ -1924,6 +1926,7 @@ class _QaPairsGenerationParams {
   final int fpsSampling;
   final int windowSizeSeconds;
   final int qaPairsPerWindow;
+  final bool skipInvalidQaPairs;
   final String qaGenerationPrompt;
 }
 
@@ -1955,6 +1958,7 @@ class _GenerateQaPairsDialogState extends State<_GenerateQaPairsDialog> {
   late String _path;
   late final Set<String> _selectedVideos;
   final Set<String> _selectedDirectories = {};
+  var _skipInvalidQaPairs = false;
   var _busy = false;
 
   @override
@@ -2045,6 +2049,13 @@ class _GenerateQaPairsDialogState extends State<_GenerateQaPairsDialog> {
                       const SizedBox(height: 12),
                       _dialogField(_qaPairsPerWindowController, 'QA-pairs per window',
                           keyboardType: const TextInputType.numberWithOptions(decimal: true)),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('skip invalid QA pairs'),
+                        subtitle: const Text('When enabled, invalid QA pairs from an LLM response are ignored instead of retrying the window.'),
+                        value: _skipInvalidQaPairs,
+                        onChanged: (value) => setState(() => _skipInvalidQaPairs = value),
+                      ),
                       const SizedBox(height: 12),
                       Text('QA generation prompt', style: Theme.of(context).textTheme.labelLarge),
                       const SizedBox(height: 8),
@@ -2319,6 +2330,7 @@ class _GenerateQaPairsDialogState extends State<_GenerateQaPairsDialog> {
       fpsSampling: fps,
       windowSizeSeconds: windowSize,
       qaPairsPerWindow: qaPairsPerWindow,
+      skipInvalidQaPairs: _skipInvalidQaPairs,
       qaGenerationPrompt: prompt,
     ));
   }
