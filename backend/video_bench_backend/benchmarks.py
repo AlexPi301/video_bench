@@ -573,7 +573,7 @@ def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], me
     correct = _score_answer(item, parsed)
     return {
         "qa_id": str(item.get("id") or item.get("qa_id") or ""),
-        "video_id": str(item.get("video_id") or ""),
+        "video_id": _normalized_qa_video_id(item),
         "question": str(item.get("question") or ""),
         "answer_format": str(item.get("answer_format") or ""),
         "family": str(item.get("family") or ""),
@@ -593,7 +593,7 @@ def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], me
 
 
 def _resolve_video_path(item: dict[str, Any]) -> Path:
-    video_id = str(item.get("video_id") or "").strip()
+    video_id = _normalized_qa_video_id(item)
     qa_dir = _safe_resolve(_mounted_root(), str(item.get("_qa_file") or "")).parent
     candidates: list[Path] = []
     for root in (qa_dir, qa_dir.parent, _mounted_root()):
@@ -608,6 +608,13 @@ def _resolve_video_path(item: dict[str, Any]) -> Path:
     if not candidates:
         raise RuntimeError(f"Could not resolve video file for video_id '{video_id}'.")
     return candidates[0].resolve()
+
+
+def _normalized_qa_video_id(item: dict[str, Any]) -> str:
+    video_id = str(item.get("video_id") or "").strip()
+    if video_id.lower().endswith(".mov"):
+        return video_id[:-4]
+    return video_id
 
 
 def _sample_evidence_frames(cv2: Any, video_path: Path, item: dict[str, Any], frame_sample_rate: int, frame_dir: Path) -> list[Path]:

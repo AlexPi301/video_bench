@@ -1687,7 +1687,7 @@ def _normalize_generated_qa_pair(
                 answer_aliases.append(answer)
     return {
         "id": qa_pair_id,
-        "video_id": str(item.get("video_id") or video_id),
+        "video_id": _qa_video_id_without_mov_suffix(video_id),
         "question": str(item.get("question") or "").strip(),
         "answer": answer,
         "answer_format": expected_format,
@@ -1728,6 +1728,13 @@ def _matching_multiple_choice_answer_index(answer: Any, choices: list[Any]) -> i
         if choice_text and (answer_text in choice_text or choice_text in answer_text):
             return index
     return None
+
+
+def _qa_video_id_without_mov_suffix(video_id: str) -> str:
+    clean = str(video_id or "").strip()
+    if clean.lower().endswith(".mov"):
+        return clean[:-4]
+    return clean
 
 
 def _normalize_multiple_choice_text(value: Any) -> str:
