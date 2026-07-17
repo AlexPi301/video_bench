@@ -1665,11 +1665,9 @@ def _normalize_generated_qa_pair(
     for span in list(item.get("evidence_spans") or []):
         if not isinstance(span, dict):
             continue
-        span_start = max(start_seconds, float(span.get("start_seconds") or start_seconds))
-        span_end = min(end_seconds, float(span.get("end_seconds") if span.get("end_seconds") is not None else span_start))
         spans.append({
-            "start_seconds": span_start,
-            "end_seconds": max(span_start, span_end),
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
             "start_frame": span.get("start_frame") if span.get("start_frame") is not None else start_frame,
             "end_frame": span.get("end_frame") if span.get("end_frame") is not None else end_frame,
             "description": str(span.get("description") or "Evidence from the sampled window."),

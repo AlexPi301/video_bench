@@ -1958,15 +1958,15 @@ class _GenerateQaPairsDialogState extends State<_GenerateQaPairsDialog> {
   late String _path;
   late final Set<String> _selectedVideos;
   final Set<String> _selectedDirectories = {};
-  var _skipInvalidQaPairs = false;
+  var _skipInvalidQaPairs = true;
   var _busy = false;
 
   @override
   void initState() {
     super.initState();
     _lmStudioUrlController = TextEditingController(text: 'http://host.docker.internal:1234/v1');
-    _modelController = TextEditingController(text: 'google/gemma-4-31b');
-    _fpsSamplingController = TextEditingController(text: '3');
+    _modelController = TextEditingController(text: 'gemma-4-26b-a4b-it-mlx');
+    _fpsSamplingController = TextEditingController(text: '15');
     _windowSizeController = TextEditingController(text: '25');
     _qaPairsPerWindowController = TextEditingController(text: '10');
     _promptController = TextEditingController(text: _defaultQaPairsPrompt);
