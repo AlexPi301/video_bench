@@ -79,12 +79,13 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
       appBar: AppBar(
         title: const Text('Video Bench'),
         actions: [
-          _NavButton(
-            identifier: 'app.nav.benchmarks',
-            label: 'Benchmarks',
-            selected: _selectedIndex == 1,
-            onPressed: () => _selectPage(1),
-          ),
+          if (_experimentalEnabled)
+            _NavButton(
+              identifier: 'app.nav.benchmarks',
+              label: 'Benchmarks',
+              selected: _selectedIndex == 1,
+              onPressed: () => _selectPage(1),
+            ),
           _NavButton(
             identifier: 'app.nav.video-bench',
             label: 'Video Bench',
@@ -102,10 +103,10 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
         ],
       ),
       body: IndexedStack(
-        index: _selectedIndex,
+        index: _stackIndex,
         children: const [
           VideoBenchPage(),
-          BenchmarksPage(),
+          if (_experimentalEnabled) BenchmarksPage(),
           if (_experimentalEnabled) ImpactCyclePage(),
         ],
       ),
@@ -131,6 +132,9 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
         }
         _selectPage(2);
       } else if (page == 'benchmarks') {
+        if (!_experimentalEnabled) {
+          throw StateError('Benchmarks is not enabled in this build.');
+        }
         _selectPage(1);
       } else if (page == 'videoBench') {
         _selectPage(0);
@@ -141,12 +145,19 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
     });
   }
 
+  int get _stackIndex {
+    if (!_experimentalEnabled || _selectedIndex <= 0) {
+      return 0;
+    }
+    return _selectedIndex;
+  }
+
   String get _selectedPageName {
     if (_selectedIndex == 1) {
-      return 'benchmarks';
+      return _experimentalEnabled ? 'benchmarks' : 'videoBench';
     }
     if (_selectedIndex == 2) {
-      return 'impactCycle';
+      return _experimentalEnabled ? 'impactCycle' : 'videoBench';
     }
     return 'videoBench';
   }

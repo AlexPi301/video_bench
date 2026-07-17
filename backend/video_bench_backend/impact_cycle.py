@@ -26,12 +26,15 @@ from django.views.decorators.http import require_GET, require_POST, require_safe
 
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
-WORKFLOW_OPERATIONS = {"vqa_generate", "track_objects", "cycle_verify", "scene_graph_eval", "vqa_eval", "caption_generate"}
+WORKFLOW_OPERATIONS = {"vqa_generate", "track_objects", "cycle_verify", "scene_graph_eval", "vqa_eval", "caption_generate", "qa_pairs_generate"}
 TRACKED_LABELS = {"person", "truck", "plane", "car"}
 DEFAULT_SAM3_PROMPT_LABELS = ("car", "truck", "person", "plane", "bicycle", "traffic light", "boat", "train", "tram")
 CAPTION_MAX_TOKENS = 20000
 CAPTION_REQUEST_TIMEOUT_SEC = 2000
 CAPTION_TIMEOUT_ATTEMPTS = 20
+QA_PAIR_RETRY_ATTEMPTS = 5
+QA_CORE_FAMILIES = ("object_attribute", "action_event", "temporal_reasoning", "trajectory_grounded", "day_night_robustness")
+QA_ALLOWED_ANSWER_FORMATS = ("multiple_choice", "yes_no", "numeric")
 _STORE_LOCK = threading.Lock()
 _RUNNING: dict[str, threading.Event] = {}
 _LM_STUDIO_FAILURES: list[dict[str, Any]] = []
@@ -496,6 +499,7 @@ def _create_impact_cycle_workflow_job(operation: str, payload: dict[str, Any]) -
         "scene_graph_eval": [pred_path, gt_path],
         "vqa_eval": [pred_path, gt_path],
         "caption_generate": [video_path],
+        "qa_pairs_generate": [video_path],
     }[operation]
     if any(not item for item in required):
         return JsonResponse({"error": "Missing required workflow input path."}, status=400)
@@ -694,6 +698,8 @@ def _run_workflow_operation(job_id: str, cancel_event: threading.Event) -> None:
         _run_vqa_eval(job_id, cancel_event)
     elif operation == "caption_generate":
         _run_caption_generate(job_id, cancel_event)
+    elif operation == "qa_pairs_generate":
+        _run_qa_pairs_generate(job_id, cancel_event)
     else:
         raise RuntimeError(f"Unsupported Impact Cycle operation: {operation}")
 
@@ -1229,6 +1235,506 @@ def _run_caption_generate(job_id: str, cancel_event: threading.Event) -> None:
         _complete_workflow_job(job_id, "Caption generation completed.", [{"type": "captions", "name": "captions.json", "path": str(out_path)}])
     finally:
         cap.release()
+
+
+def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
+    job = _load_job(job_id)
+    inputs = dict(job.get("inputs") or {})
+    settings_payload = dict(job.get("settings") or {})
+    video_rel = str(inputs.get("videoPath") or "").strip()
+    video_path = _safe_resolve(_mounted_root(), video_rel)
+    if not video_path.is_file() or video_path.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise RuntimeError("Mounted video file not found for QA-pair generation.")
+
+    lm_studio_url = str(settings_payload.get("lmStudioUrl") or "http://host.docker.internal:1234/v1").strip()
+    model_name = str(settings_payload.get("model") or "google/gemma-4-31b").strip()
+    litellm_model = model_name if model_name.startswith("openai/") else f"openai/{model_name}"
+    fps_sampling = max(1, int(settings_payload.get("fpsSampling", 3) or 3))
+    window_size = max(1, int(settings_payload.get("windowSizeSeconds", 25) or 25))
+    qa_pairs_per_window = max(1, int(settings_payload.get("qaPairsPerWindow", 10) or 10))
+    qa_prompt = str(settings_payload.get("qaGenerationPrompt") or "").strip()
+    if not qa_prompt:
+        raise RuntimeError("QA generation prompt is required.")
+
+    cv2 = _import_required("cv2", "OpenCV is required for QA-pair generation.")
+    litellm = _import_required("litellm", "LiteLLM is required for LM Studio QA-pair calls.")
+
+    run_dir = Path(str(job.get("run_dir") or ""))
+    frame_dir = run_dir / "qa_pair_frames"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(str(job.get("output_dir") or ""))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "qa_pairs.json"
+    log_path = out_dir / "qa_pairs_generation.log.jsonl"
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Unable to open selected video for QA-pair generation.")
+    try:
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 1.0
+        duration_seconds = frame_count / source_fps if frame_count > 0 else 0.0
+        total_windows = max(1, math.ceil(duration_seconds / float(window_size)))
+        existing_payload = _load_or_create_qa_pairs_payload(out_path, video_path, video_rel)
+        qa_pairs = [dict(item) for item in list(existing_payload.get("qa_pairs") or []) if isinstance(item, dict)]
+        next_qa_pair_id = _next_qa_pair_id(qa_pairs)
+        job = _update_job(
+            job_id,
+            progress={"processedFrames": 0, "totalFrames": total_windows, "percent": 0},
+            video={**dict(job.get("video") or {}), "name": video_path.name, "frameCount": frame_count, "sourceFps": source_fps},
+        )
+        _append_event(job, "qa_start", f"Generating QA pairs for {total_windows} window(s) of {video_path.name}.")
+
+        for window_index in range(total_windows):
+            if cancel_event.is_set() or str(_load_job(job_id).get("status")) == "cancelled":
+                job = _update_job(job_id, status="cancelled")
+                _append_event(job, "cancelled", "QA-pair generation cancelled.")
+                _cleanup_unfinished_job_files(job)
+                return
+            start_seconds = float(window_index * window_size)
+            end_seconds = min(float((window_index + 1) * window_size), max(duration_seconds, start_seconds + window_size))
+            frame_indices = _qa_window_frame_indices(source_fps, frame_count, start_seconds, end_seconds, fps_sampling)
+            if not frame_indices:
+                frame_indices = [min(max(0, frame_count - 1), int(start_seconds * source_fps))]
+            frame_paths = [_extract_frame(cv2, cap, video_path, frame_idx, frame_dir)[0] for frame_idx in frame_indices]
+
+            sequence_index = max(0, next_qa_pair_id - 1)
+            expected_families = [QA_CORE_FAMILIES[(sequence_index + offset) % len(QA_CORE_FAMILIES)] for offset in range(qa_pairs_per_window)]
+            expected_formats = [QA_ALLOWED_ANSWER_FORMATS[(sequence_index + offset) % len(QA_ALLOWED_ANSWER_FORMATS)] for offset in range(qa_pairs_per_window)]
+            retry_feedback = ""
+            generated: list[dict[str, Any]] | None = None
+            last_error = ""
+            for attempt in range(1, QA_PAIR_RETRY_ATTEMPTS + 1):
+                prompt = _qa_pairs_prompt(
+                    base_prompt=qa_prompt,
+                    video_rel=video_rel,
+                    video_name=video_path.name,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    frame_indices=frame_indices,
+                    qa_pairs_per_window=qa_pairs_per_window,
+                    expected_families=expected_families,
+                    expected_formats=expected_formats,
+                    previous_pairs=qa_pairs[-10:],
+                    retry_feedback=retry_feedback,
+                )
+                _append_event(job, "qa_window", f"Requesting QA pairs for window {window_index + 1}/{total_windows}, attempt {attempt}/{QA_PAIR_RETRY_ATTEMPTS}.")
+                _append_qa_generation_log(
+                    log_path,
+                    event="attempt",
+                    job_id=job_id,
+                    video_rel=video_rel,
+                    window_index=window_index,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    attempt=attempt,
+                    message=f"Requesting QA pairs for window {window_index + 1}/{total_windows}.",
+                )
+                try:
+                    response = litellm.completion(
+                        model=litellm_model,
+                        api_base=lm_studio_url,
+                        api_key="lm-studio",
+                        messages=[{"role": "user", "content": _qa_prompt_content(prompt, frame_paths)}],
+                        temperature=0,
+                        max_tokens=CAPTION_MAX_TOKENS,
+                        timeout=CAPTION_REQUEST_TIMEOUT_SEC,
+                    )
+                    raw_text = _caption_completion_text(response)
+                    if not raw_text:
+                        raise RuntimeError(f"LM Studio returned an empty QA completion ({_litellm_empty_completion_details(response)}).")
+                    payload = _parse_qa_pairs_completion(raw_text)
+                    candidate_pairs = _extract_qa_pair_list(payload)
+                    _validate_generated_qa_pairs(
+                        candidate_pairs,
+                        qa_pairs_per_window=qa_pairs_per_window,
+                        expected_families=expected_families,
+                        expected_formats=expected_formats,
+                        start_seconds=start_seconds,
+                        end_seconds=end_seconds,
+                    )
+                    generated = candidate_pairs
+                    break
+                except Exception as exc:
+                    last_error = str(exc)
+                    retry_feedback = f"Previous response was invalid: {last_error}. Fix this exactly and return only valid JSON."
+                    _append_event(job, "qa_retry", f"QA validation failed for window {window_index + 1}/{total_windows}: {last_error[:300]}", attempt=attempt)
+                    _append_qa_generation_log(
+                        log_path,
+                        event="retry",
+                        job_id=job_id,
+                        video_rel=video_rel,
+                        window_index=window_index,
+                        start_seconds=start_seconds,
+                        end_seconds=end_seconds,
+                        attempt=attempt,
+                        message=f"QA validation failed for window {window_index + 1}/{total_windows}.",
+                        error=last_error,
+                    )
+                    _record_lm_studio_failure_if_connection(last_error, job_id)
+            if generated is None:
+                _append_qa_generation_log(
+                    log_path,
+                    event="failed",
+                    job_id=job_id,
+                    video_rel=video_rel,
+                    window_index=window_index,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    message=f"QA-pair generation failed for window {window_index + 1}/{total_windows} after {QA_PAIR_RETRY_ATTEMPTS} attempts.",
+                    error=last_error,
+                )
+                raise RuntimeError(f"QA-pair generation failed for window {window_index + 1}/{total_windows} after {QA_PAIR_RETRY_ATTEMPTS} attempts: {last_error}")
+
+            for offset, item in enumerate(generated):
+                normalized = _normalize_generated_qa_pair(
+                    item,
+                    video_id=video_path.stem,
+                    qa_pair_id=str(next_qa_pair_id),
+                    expected_family=expected_families[offset],
+                    expected_format=expected_formats[offset],
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    start_frame=frame_indices[0],
+                    end_frame=frame_indices[-1],
+                )
+                next_qa_pair_id += 1
+                qa_pairs.append(normalized)
+                _append_qa_generation_log(
+                    log_path,
+                    event="generated",
+                    job_id=job_id,
+                    video_rel=video_rel,
+                    window_index=window_index,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    qa_pair=normalized,
+                )
+            _write_json_atomic(out_path, _qa_pairs_output_payload(existing_payload, video_path, video_rel, qa_pairs))
+            percent = round((window_index + 1) * 100 / max(1, total_windows))
+            job = _update_job(job_id, progress={"processedFrames": window_index + 1, "totalFrames": total_windows, "percent": percent})
+            _append_event(job, "qa_window_done", f"Generated {len(generated)} QA pair(s) for window {window_index + 1}/{total_windows}.", percent=percent)
+
+        _complete_workflow_job(job_id, "QA-pair generation completed.", [{"type": "qa_pairs", "name": "qa_pairs.json", "path": str(out_path)}])
+    finally:
+        cap.release()
+
+
+def _qa_window_frame_indices(source_fps: float, frame_count: int, start_seconds: float, end_seconds: float, fps_sampling: int) -> list[int]:
+    if frame_count <= 0:
+        return []
+    start = max(0, int(start_seconds * source_fps))
+    end = min(frame_count - 1, max(start, int(end_seconds * source_fps)))
+    return list(range(start, end + 1, max(1, fps_sampling)))
+
+
+def _qa_prompt_content(prompt: str, frame_paths: list[Path]) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for path in frame_paths:
+        with path.open("rb") as handle:
+            image_b64 = base64.b64encode(handle.read()).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+    return content
+
+
+def _qa_pairs_prompt(
+    *,
+    base_prompt: str,
+    video_rel: str,
+    video_name: str,
+    start_seconds: float,
+    end_seconds: float,
+    frame_indices: list[int],
+    qa_pairs_per_window: int,
+    expected_families: list[str],
+    expected_formats: list[str],
+    previous_pairs: list[dict[str, Any]],
+    retry_feedback: str,
+) -> str:
+    return (
+        f"{base_prompt}\n\n"
+        "You are creating benchmark QA pairs for highly shaky first-person running videos, as described in Practical course topic.md: "
+        "the benchmark evaluates MLLMs on unstable ego-motion-heavy videos with rapid viewpoint changes, blur, occlusion, day/night variation, "
+        "temporal grounding, trajectory/location awareness, object/event understanding, and robustness.\n\n"
+        f"Video: {video_name} ({video_rel})\n"
+        f"Window: {start_seconds:.3f}s to {end_seconds:.3f}s\n"
+        f"Sampled frame indices: {json.dumps(frame_indices)}\n"
+        f"Return exactly {qa_pairs_per_window} QA pairs.\n"
+        f"Family sequence for this window, in order: {json.dumps(expected_families)}\n"
+        f"Answer format sequence for this window, in order: {json.dumps(expected_formats)}\n\n"
+        "Use only these five core QA families, represented by these schema family values: "
+        "object_attribute, action_event, temporal_reasoning, trajectory_grounded, day_night_robustness. "
+        "They correspond to Object/attribute, Action/event, Temporal reasoning, Trajectory/location-aware, and Robustness.\n"
+        "Use only answer_formats multiple_choice, yes_no, numeric in the exact sequential order provided. Never generate open-ended questions.\n"
+        "For multiple_choice, provide a non-empty choices list and set answer to one correct choice exactly from choices.\n"
+        "For yes_no, set answer to true or false. For numeric, set answer to a number.\n"
+        "Always set a valid, correct answer based on evidence from the provided visual frames/captions. Do not hallucinate.\n"
+        "Each new QA pair must relate to different aspects of the video scenery than the last QA pairs and must not be too similar.\n"
+        "Cover a rich variety of difficulties, families, and reasoning types according to doc/qa_pairs/README.md.\n"
+        "Use evidence_spans inside this window. Include start_seconds, end_seconds, start_frame, end_frame, and description.\n"
+        "Return one JSON object and no markdown with this exact shape: {\"qa_pairs\": [ ... ]}.\n"
+        "Each QA pair must contain: id, video_id, question, answer, answer_format, family, reasoning_types, difficulty, visibility, day_night, "
+        "evidence_spans, trajectory_linkage, choices, answer_aliases, unanswerable. Set unanswerable to false.\n"
+        f"Previous QA pairs to avoid repeating: {json.dumps(previous_pairs, ensure_ascii=True)[:6000]}\n"
+        f"{retry_feedback}"
+    )
+
+
+def _parse_qa_pairs_completion(raw_text: str) -> dict[str, Any]:
+    text = raw_text.strip()
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        raise RuntimeError("LLM response did not contain a JSON object.")
+    payload = json.loads(match.group(0))
+    if not isinstance(payload, dict):
+        raise RuntimeError("LLM JSON response must be an object.")
+    return payload
+
+
+def _extract_qa_pair_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = payload.get("qa_pairs")
+    if not isinstance(raw, list):
+        raise RuntimeError("LLM JSON must contain a qa_pairs list.")
+    return [dict(item) for item in raw if isinstance(item, dict)]
+
+
+def _validate_generated_qa_pairs(
+    pairs: list[dict[str, Any]],
+    *,
+    qa_pairs_per_window: int,
+    expected_families: list[str],
+    expected_formats: list[str],
+    start_seconds: float,
+    end_seconds: float,
+) -> None:
+    if len(pairs) != qa_pairs_per_window:
+        raise RuntimeError(f"Expected exactly {qa_pairs_per_window} qa_pairs, got {len(pairs)}.")
+    questions: set[str] = set()
+    for index, item in enumerate(pairs):
+        question = str(item.get("question") or "").strip()
+        if not question:
+            raise RuntimeError(f"QA pair {index + 1} is missing a question.")
+        question_key = question.lower()
+        if question_key in questions:
+            raise RuntimeError(f"QA pair {index + 1} repeats a question in the same window.")
+        questions.add(question_key)
+        family = str(item.get("family") or "").strip()
+        if family != expected_families[index]:
+            raise RuntimeError(f"QA pair {index + 1} has family {family!r}, expected {expected_families[index]!r}.")
+        answer_format = str(item.get("answer_format") or "").strip()
+        if answer_format != expected_formats[index]:
+            raise RuntimeError(f"QA pair {index + 1} has answer_format {answer_format!r}, expected {expected_formats[index]!r}.")
+        if answer_format == "multiple_choice":
+            choices = list(item.get("choices") or [])
+            if not choices or not all(isinstance(choice, str) and choice.strip() for choice in choices):
+                raise RuntimeError(f"QA pair {index + 1} multiple_choice requires non-empty string choices.")
+            if _matching_multiple_choice_answer_index(item.get("answer"), choices) is None:
+                raise RuntimeError(f"QA pair {index + 1} multiple_choice answer must be one of choices.")
+        elif answer_format == "yes_no":
+            if not isinstance(item.get("answer"), bool):
+                raise RuntimeError(f"QA pair {index + 1} yes_no answer must be boolean.")
+        elif answer_format == "numeric":
+            if not isinstance(item.get("answer"), (int, float)) or isinstance(item.get("answer"), bool):
+                raise RuntimeError(f"QA pair {index + 1} numeric answer must be a number.")
+        else:
+            raise RuntimeError(f"QA pair {index + 1} uses unsupported answer_format {answer_format!r}.")
+        spans = list(item.get("evidence_spans") or [])
+        if not spans or not all(isinstance(span, dict) for span in spans):
+            raise RuntimeError(f"QA pair {index + 1} requires evidence_spans.")
+        for span in spans:
+            span_start = float(span.get("start_seconds") or 0)
+            span_end = float(span.get("end_seconds") if span.get("end_seconds") is not None else span_start)
+            if span_start < start_seconds - 0.001 or span_end > end_seconds + 0.001 or span_end < span_start:
+                raise RuntimeError(f"QA pair {index + 1} evidence span must stay inside the current window.")
+        if bool(item.get("unanswerable", False)):
+            raise RuntimeError(f"QA pair {index + 1} must be answerable with a valid answer.")
+
+
+def _normalize_generated_qa_pair(
+    item: dict[str, Any],
+    *,
+    video_id: str,
+    qa_pair_id: str,
+    expected_family: str,
+    expected_format: str,
+    start_seconds: float,
+    end_seconds: float,
+    start_frame: int,
+    end_frame: int,
+) -> dict[str, Any]:
+    spans = []
+    for span in list(item.get("evidence_spans") or []):
+        if not isinstance(span, dict):
+            continue
+        span_start = max(start_seconds, float(span.get("start_seconds") or start_seconds))
+        span_end = min(end_seconds, float(span.get("end_seconds") if span.get("end_seconds") is not None else span_start))
+        spans.append({
+            "start_seconds": span_start,
+            "end_seconds": max(span_start, span_end),
+            "start_frame": span.get("start_frame") if span.get("start_frame") is not None else start_frame,
+            "end_frame": span.get("end_frame") if span.get("end_frame") is not None else end_frame,
+            "description": str(span.get("description") or "Evidence from the sampled window."),
+        })
+    if not spans:
+        spans = [{"start_seconds": start_seconds, "end_seconds": end_seconds, "start_frame": start_frame, "end_frame": end_frame, "description": "Evidence from the sampled window."}]
+    answer = item.get("answer")
+    choices = [str(choice) for choice in list(item.get("choices") or [])]
+    answer_aliases = [str(alias) for alias in list(item.get("answer_aliases") or [])]
+    if expected_format == "multiple_choice":
+        match_index = _matching_multiple_choice_answer_index(answer, choices)
+        if match_index is not None:
+            answer = choices[match_index]
+            if answer not in answer_aliases:
+                answer_aliases.append(answer)
+    return {
+        "id": qa_pair_id,
+        "video_id": str(item.get("video_id") or video_id),
+        "question": str(item.get("question") or "").strip(),
+        "answer": answer,
+        "answer_format": expected_format,
+        "family": expected_family,
+        "reasoning_types": _valid_reasoning_types(list(item.get("reasoning_types") or []), expected_family),
+        "difficulty": str(item.get("difficulty") if item.get("difficulty") in {"easy", "medium", "hard"} else "medium"),
+        "visibility": str(item.get("visibility") if item.get("visibility") in {"clear", "blurred", "occluded", "dark", "glare", "mixed"} else "mixed"),
+        "day_night": str(item.get("day_night") if item.get("day_night") in {"day", "night", "mixed", "unknown"} else "unknown"),
+        "evidence_spans": spans,
+        "trajectory_linkage": item.get("trajectory_linkage") if isinstance(item.get("trajectory_linkage"), dict) else None,
+        "choices": choices,
+        "answer_aliases": answer_aliases,
+        "unanswerable": False,
+    }
+
+
+def _matching_multiple_choice_answer_index(answer: Any, choices: list[Any]) -> int | None:
+    if isinstance(answer, int) and not isinstance(answer, bool) and 1 <= answer <= len(choices):
+        return answer - 1
+    answer_text = _normalize_multiple_choice_text(answer)
+    if not answer_text:
+        return None
+    if answer_text.isdigit():
+        index = int(answer_text)
+        if 1 <= index <= len(choices):
+            return index - 1
+    letter_match = re.fullmatch(r"(?:choice|option|answer)?\s*([a-e])", answer_text)
+    if letter_match:
+        index = ord(letter_match.group(1)) - ord("a")
+        if 0 <= index < len(choices):
+            return index
+    for index, choice in enumerate(choices):
+        choice_text = _normalize_multiple_choice_text(choice)
+        if answer_text == choice_text:
+            return index
+    for index, choice in enumerate(choices):
+        choice_text = _normalize_multiple_choice_text(choice)
+        if choice_text and (answer_text in choice_text or choice_text in answer_text):
+            return index
+    return None
+
+
+def _normalize_multiple_choice_text(value: Any) -> str:
+    text = str(value if value is not None else "").strip().lower()
+    text = re.sub(r"^\s*(?:choice|option|answer)?\s*[a-e1-5][\).:-]\s*", "", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _valid_reasoning_types(values: list[Any], family: str) -> list[str]:
+    allowed = {"perception", "action_recognition", "temporal_ordering", "event_localization", "spatial_relation", "scene_understanding", "trajectory_alignment", "counting", "absence_detection", "ambiguity_handling"}
+    out = [str(value) for value in values if str(value) in allowed]
+    if out:
+        return out
+    defaults = {
+        "object_attribute": ["perception"],
+        "action_event": ["action_recognition"],
+        "temporal_reasoning": ["temporal_ordering"],
+        "trajectory_grounded": ["trajectory_alignment"],
+        "day_night_robustness": ["ambiguity_handling"],
+    }
+    return defaults.get(family, ["perception"])
+
+
+def _load_or_create_qa_pairs_payload(out_path: Path, video_path: Path, video_rel: str) -> dict[str, Any]:
+    if out_path.is_file():
+        try:
+            payload = _read_json_file(out_path)
+            if isinstance(payload.get("qa_pairs"), list):
+                return payload
+        except Exception:
+            pass
+    return {"name": video_path.stem, "version": "1.0", "description": "Annotations created in Video Bench", "video_path": video_rel, "qa_pairs": []}
+
+
+def _qa_pairs_output_payload(existing_payload: dict[str, Any], video_path: Path, video_rel: str, qa_pairs: list[dict[str, Any]]) -> dict[str, Any]:
+    payload = dict(existing_payload)
+    payload.setdefault("name", video_path.stem)
+    payload.setdefault("version", "1.0")
+    payload.setdefault("description", "Annotations created in Video Bench")
+    payload["video_path"] = video_rel
+    payload["qa_pairs"] = qa_pairs
+    return payload
+
+
+def _next_qa_pair_id(qa_pairs: list[dict[str, Any]]) -> int:
+    max_index = 0
+    for item in qa_pairs:
+        qa_id = str(item.get("id") or "")
+        match = re.search(r"(?:^|_)qa_(\d+)$", qa_id)
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+            continue
+        match = re.search(r"(\d+)$", qa_id)
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    return max_index + 1
+
+
+def _append_qa_generation_log(
+    log_path: Path,
+    *,
+    event: str,
+    job_id: str,
+    video_rel: str,
+    window_index: int,
+    start_seconds: float,
+    end_seconds: float,
+    attempt: int | None = None,
+    message: str = "",
+    error: str = "",
+    qa_pair: dict[str, Any] | None = None,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "ts": _now_iso(),
+        "event": event,
+        "job_id": job_id,
+        "video_path": video_rel,
+        "window_index": window_index,
+        "start_seconds": start_seconds,
+        "end_seconds": end_seconds,
+    }
+    if attempt is not None:
+        row["attempt"] = attempt
+    if message:
+        row["message"] = message
+    if error:
+        row["error"] = error
+    if qa_pair is not None:
+        row.update({
+            "qa_pair_id": str(qa_pair.get("id") or ""),
+            "question": str(qa_pair.get("question") or ""),
+            "answer_format": str(qa_pair.get("answer_format") or ""),
+            "family": str(qa_pair.get("family") or ""),
+        })
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=True))
+        handle.write("\n")
 
 
 def _format_caption_timestamp(timestamp_ms: int) -> str:

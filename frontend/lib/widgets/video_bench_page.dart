@@ -20,6 +20,8 @@ import 'drop_zone_panel.dart';
 import 'timeline_bar.dart';
 import 'web_video_surface.dart';
 
+const _experimentalEnabled = bool.fromEnvironment('VIDEO_BENCH_EXPERIMENTAL');
+
 class VideoBenchPage extends StatefulWidget {
   const VideoBenchPage({super.key});
 
@@ -367,7 +369,7 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
           exists: _qaPairsFound == true,
           checking: _qaPairsFound == null && _metadataDirectory.isNotEmpty,
           generateButtonLabel: 'generate qa pairs',
-          onGeneratePressed: null,
+          onGeneratePressed: _experimentalEnabled ? _openGenerateQaPairsDialog : null,
           onBrowsePressed: _openMountedAnnotationJsonDialog,
         ),
         const SizedBox(height: 8),
@@ -376,7 +378,7 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
           exists: _captionsFound == true,
           checking: _captionsFound == null && _metadataDirectory.isNotEmpty,
           generateButtonLabel: 'generate captions',
-          onGeneratePressed: _videoController.hasVideo ? _openGenerateCaptionsDialog : null,
+          onGeneratePressed: _openGenerateCaptionsDialog,
           onBrowsePressed: _openMountedCaptionsDialog,
         ),
       ],
@@ -638,6 +640,85 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
         });
       }
     }
+  }
+
+  Future<void> _openGenerateQaPairsDialog() async {
+    final result = await showDialog<_QaPairsGenerationParams>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => _GenerateQaPairsDialog(
+        client: _mountedFilesClient,
+        defaultOutputDirectory: _metadataDirectory,
+        videoFilename: _videoFilename ?? '',
+        initialVideoPath: _mountedVideoPath,
+      ),
+    );
+    if (result == null || !mounted) {
+      return;
+    }
+
+    setState(() {
+      _errorMessage = null;
+      _statusMessage = 'Creating QA-pair generation jobs...';
+    });
+
+    try {
+      final jobIds = <String>[];
+      for (final videoPath in result.videoPaths) {
+        final outputDirectory = _metadataDirectoryForVideoPath(videoPath);
+        final request = await html.HttpRequest.request(
+          '/api/impact-cycle/jobs/',
+          method: 'POST',
+          requestHeaders: {'Content-Type': 'application/json'},
+          sendData: jsonEncode({
+            'operation': 'qa_pairs_generate',
+            'inputs': {
+              'videoPath': videoPath,
+            },
+            'settings': {
+              'lmStudioUrl': result.lmStudioUrl,
+              'model': result.model,
+              'fpsSampling': result.fpsSampling,
+              'windowSizeSeconds': result.windowSizeSeconds,
+              'qaPairsPerWindow': result.qaPairsPerWindow,
+              'qaGenerationPrompt': result.qaGenerationPrompt,
+              'outputDirectory': outputDirectory,
+              'directOutput': true,
+            },
+          }),
+        );
+        final json = jsonDecode(request.responseText ?? '{}') as Map<String, dynamic>;
+        final jobId = json['id']?.toString() ?? '';
+        if (jobId.isNotEmpty) {
+          jobIds.add(jobId);
+        }
+      }
+      await _refreshStatusPanels();
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Created ${jobIds.length} QA-pair generation job(s).';
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _errorMessage = 'Could not create QA-pair generation jobs: $error';
+          _statusMessage = 'QA-pair generation job creation failed.';
+        });
+      }
+    }
+  }
+
+  String _metadataDirectoryForVideoPath(String videoPath) {
+    final parts = videoPath.split('/');
+    final filename = parts.isEmpty ? videoPath : parts.last;
+    final dotIndex = filename.lastIndexOf('.');
+    final stem = dotIndex <= 0 ? filename : filename.substring(0, dotIndex);
+    final metaName = '${stem}_meta';
+    if (parts.length <= 1) {
+      return metaName;
+    }
+    return [...parts.sublist(0, parts.length - 1), metaName].join('/');
   }
 
   Future<void> _loadMountedCsv(MountedFileEntry entry) async {
@@ -942,7 +1023,7 @@ class _VideoBenchPageState extends State<VideoBenchPage> {
         return;
       }
       setState(() {
-        _errorMessage = 'Could not save annotation JSON: $error';
+        _errorMessage = 'Could not save annotation JSON to $targetPath: $error';
         _statusMessage = 'Annotation saved in memory only.';
       });
     }
@@ -1825,6 +1906,427 @@ class _CaptionGenerationParams {
   final int fpsSampling;
   final String captionPrompt;
 }
+
+class _QaPairsGenerationParams {
+  const _QaPairsGenerationParams({
+    required this.videoPaths,
+    required this.lmStudioUrl,
+    required this.model,
+    required this.fpsSampling,
+    required this.windowSizeSeconds,
+    required this.qaPairsPerWindow,
+    required this.qaGenerationPrompt,
+  });
+
+  final List<String> videoPaths;
+  final String lmStudioUrl;
+  final String model;
+  final int fpsSampling;
+  final int windowSizeSeconds;
+  final int qaPairsPerWindow;
+  final String qaGenerationPrompt;
+}
+
+class _GenerateQaPairsDialog extends StatefulWidget {
+  const _GenerateQaPairsDialog({
+    required this.client,
+    required this.defaultOutputDirectory,
+    required this.videoFilename,
+    required this.initialVideoPath,
+  });
+
+  final MountedFilesClient client;
+  final String defaultOutputDirectory;
+  final String videoFilename;
+  final String initialVideoPath;
+
+  @override
+  State<_GenerateQaPairsDialog> createState() => _GenerateQaPairsDialogState();
+}
+
+class _GenerateQaPairsDialogState extends State<_GenerateQaPairsDialog> {
+  late final TextEditingController _lmStudioUrlController;
+  late final TextEditingController _modelController;
+  late final TextEditingController _fpsSamplingController;
+  late final TextEditingController _windowSizeController;
+  late final TextEditingController _qaPairsPerWindowController;
+  late final TextEditingController _promptController;
+  late Future<MountedFileListing> _listingFuture;
+  late String _path;
+  late final Set<String> _selectedVideos;
+  final Set<String> _selectedDirectories = {};
+  var _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _lmStudioUrlController = TextEditingController(text: 'http://host.docker.internal:1234/v1');
+    _modelController = TextEditingController(text: 'google/gemma-4-31b');
+    _fpsSamplingController = TextEditingController(text: '3');
+    _windowSizeController = TextEditingController(text: '25');
+    _qaPairsPerWindowController = TextEditingController(text: '10');
+    _promptController = TextEditingController(text: _defaultQaPairsPrompt);
+    _path = _directoryOf(widget.initialVideoPath);
+    _selectedVideos = {
+      if (widget.initialVideoPath.isNotEmpty) widget.initialVideoPath,
+    };
+    _listingFuture = _loadListing();
+  }
+
+  @override
+  void dispose() {
+    _lmStudioUrlController.dispose();
+    _modelController.dispose();
+    _fpsSamplingController.dispose();
+    _windowSizeController.dispose();
+    _qaPairsPerWindowController.dispose();
+    _promptController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 980, maxHeight: 920),
+        child: Padding(
+          padding: const EdgeInsets.all(22),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.quiz, color: Theme.of(context).colorScheme.primary),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text('Generate QA pairs', style: Theme.of(context).textTheme.titleLarge),
+                  ),
+                  IconButton(
+                    tooltip: 'Close',
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(
+                widget.videoFilename.isNotEmpty
+                    ? 'Video: ${widget.videoFilename}'
+                    : 'No video loaded',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF94A3B8)),
+              ),
+              if (widget.defaultOutputDirectory.isNotEmpty) ...[
+                const SizedBox(height: 2),
+                Text(
+                  'Output: ${widget.defaultOutputDirectory}/qa_pairs.json',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF94A3B8)),
+                ),
+              ],
+              const SizedBox(height: 18),
+              Flexible(
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Mounted videos', style: Theme.of(context).textTheme.labelLarge),
+                      const SizedBox(height: 8),
+                      _buildMountedVideoBrowser(context),
+                      const SizedBox(height: 12),
+                      _dialogField(_lmStudioUrlController, 'LM Studio URL'),
+                      const SizedBox(height: 12),
+                      _dialogField(_modelController, 'Model'),
+                      const SizedBox(height: 12),
+                      _dialogField(_fpsSamplingController, 'FPS sampling',
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true)),
+                      const SizedBox(height: 12),
+                      _dialogField(_windowSizeController, 'Window size in seconds',
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true)),
+                      const SizedBox(height: 12),
+                      _dialogField(_qaPairsPerWindowController, 'QA-pairs per window',
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true)),
+                      const SizedBox(height: 12),
+                      Text('QA generation prompt', style: Theme.of(context).textTheme.labelLarge),
+                      const SizedBox(height: 8),
+                      Semantics(
+                        identifier: 'qa-pairs-dialog.prompt',
+                        textField: true,
+                        label: 'QA generation prompt',
+                        child: TextField(
+                          controller: _promptController,
+                          maxLines: 8,
+                          decoration: const InputDecoration(
+                            border: OutlineInputBorder(),
+                            hintText: 'Enter the prompt for QA-pair generation...',
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  Semantics(
+                    identifier: 'qa-pairs-dialog.cancel',
+                    button: true,
+                    label: 'Cancel',
+                    child: TextButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: const Text('Cancel'),
+                    ),
+                  ),
+                  const Spacer(),
+                  Semantics(
+                    identifier: 'qa-pairs-dialog.generate',
+                    button: true,
+                    label: 'Generate',
+                    child: FilledButton.icon(
+                      onPressed: _generate,
+                      icon: const Icon(Icons.auto_awesome),
+                      label: const Text('Generate'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMountedVideoBrowser(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: Theme.of(context).dividerColor),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: SizedBox(
+        height: 360,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: FutureBuilder<MountedFileListing>(
+            future: _listingFuture,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done || _busy) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              if (snapshot.hasError) {
+                return Center(child: Text('Could not browse mounted files: ${snapshot.error}'));
+              }
+              final listing = snapshot.data!;
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          listing.path.isEmpty ? 'Mounted input root' : listing.path,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                      ),
+                      TextButton.icon(
+                        onPressed: listing.parent == null ? null : () => _openDirectory(listing.parent!),
+                        icon: const Icon(Icons.arrow_upward),
+                        label: const Text('Up'),
+                      ),
+                    ],
+                  ),
+                  Text(
+                    '${_selectedVideos.length} video file(s), ${_selectedDirectories.length} folder(s) selected',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(child: _buildEntryList(listing.entries)),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEntryList(List<MountedFileEntry> entries) {
+    if (entries.isEmpty) {
+      return const Center(child: Text('No files or folders in this directory.'));
+    }
+    return ListView.separated(
+      itemCount: entries.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (context, index) {
+        final entry = entries[index];
+        final selected = entry.isDirectory
+            ? _selectedDirectories.contains(entry.path)
+            : _selectedVideos.contains(entry.path);
+        return ListTile(
+          dense: true,
+          leading: Checkbox(
+            value: selected,
+            onChanged: entry.isDirectory
+                ? (_) => _toggleDirectory(entry.path)
+                : entry.isVideo
+                    ? (_) => _toggleVideo(entry.path)
+                    : null,
+          ),
+          title: Text(entry.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text(
+            entry.isDirectory ? 'Directory' : '${entry.kind.toUpperCase()} - ${entry.path}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          enabled: entry.isDirectory || entry.isVideo,
+          trailing: entry.isDirectory
+              ? IconButton(
+                  tooltip: 'Open folder',
+                  icon: const Icon(Icons.chevron_right),
+                  onPressed: () => _openDirectory(entry.path),
+                )
+              : null,
+          onTap: entry.isDirectory ? () => _toggleDirectory(entry.path) : entry.isVideo ? () => _toggleVideo(entry.path) : null,
+        );
+      },
+    );
+  }
+
+  Widget _dialogField(TextEditingController controller, String label, {TextInputType? keyboardType}) {
+    return Semantics(
+      identifier: 'qa-pairs-dialog.${_semanticIdForLabel(label)}',
+      textField: true,
+      label: label,
+      child: TextField(
+        controller: controller,
+        keyboardType: keyboardType,
+        decoration: InputDecoration(
+          labelText: label,
+          border: const OutlineInputBorder(),
+        ),
+      ),
+    );
+  }
+
+  void _toggleVideo(String path) {
+    setState(() {
+      if (!_selectedVideos.remove(path)) {
+        _selectedVideos.add(path);
+      }
+    });
+  }
+
+  Future<void> _selectDirectory(String path) async {
+    setState(() => _busy = true);
+    try {
+      final videos = await _collectVideoFiles(path);
+      setState(() {
+        _selectedDirectories.add(path);
+        _selectedVideos.addAll(videos);
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  Future<void> _toggleDirectory(String path) async {
+    if (_selectedDirectories.contains(path)) {
+      setState(() => _busy = true);
+      try {
+        final videos = await _collectVideoFiles(path);
+        setState(() {
+          _selectedDirectories.remove(path);
+          _selectedVideos.removeAll(videos);
+        });
+      } finally {
+        if (mounted) {
+          setState(() => _busy = false);
+        }
+      }
+      return;
+    }
+    await _selectDirectory(path);
+  }
+
+  Future<List<String>> _collectVideoFiles(String path) async {
+    final listing = await widget.client.list(path: path, kind: 'all');
+    final videos = <String>[];
+    for (final entry in listing.entries) {
+      if (entry.isDirectory) {
+        videos.addAll(await _collectVideoFiles(entry.path));
+      } else if (entry.isVideo) {
+        videos.add(entry.path);
+      }
+    }
+    return videos;
+  }
+
+  void _openDirectory(String path) {
+    setState(() {
+      _path = path;
+      _listingFuture = _loadListing();
+    });
+  }
+
+  Future<MountedFileListing> _loadListing() => widget.client.list(path: _path, kind: 'all');
+
+  String _directoryOf(String path) {
+    final parts = path.split('/');
+    if (parts.length <= 1) {
+      return '';
+    }
+    return parts.sublist(0, parts.length - 1).join('/');
+  }
+
+  String _semanticIdForLabel(String label) {
+    return label
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+        .replaceAll(RegExp(r'^-+|-+$'), '');
+  }
+
+  void _generate() {
+    final videoPaths = _selectedVideos.toList()..sort();
+    final url = _lmStudioUrlController.text.trim();
+    final model = _modelController.text.trim();
+    final fps = int.tryParse(_fpsSamplingController.text.trim());
+    final windowSize = int.tryParse(_windowSizeController.text.trim());
+    final qaPairsPerWindow = int.tryParse(_qaPairsPerWindowController.text.trim());
+    final prompt = _promptController.text.trim();
+    if (videoPaths.isEmpty ||
+        url.isEmpty ||
+        model.isEmpty ||
+        fps == null ||
+        fps < 1 ||
+        windowSize == null ||
+        windowSize < 1 ||
+        qaPairsPerWindow == null ||
+        qaPairsPerWindow < 1 ||
+        prompt.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Select at least one video and fill all fields with positive numeric values.')),
+      );
+      return;
+    }
+    Navigator.of(context).pop(_QaPairsGenerationParams(
+      videoPaths: videoPaths,
+      lmStudioUrl: url,
+      model: model,
+      fpsSampling: fps,
+      windowSizeSeconds: windowSize,
+      qaPairsPerWindow: qaPairsPerWindow,
+      qaGenerationPrompt: prompt,
+    ));
+  }
+}
+
+const _defaultQaPairsPrompt = 'Generate question-answer pairs for the selected video windows. '
+    'Focus on visually grounded facts, object interactions, temporal changes, and scene context. '
+    'Return concise questions with accurate answers based only on visible evidence.';
 
 const _defaultCaptionPrompt = 'You are a detailed video frame captioner. '
     'Describe everything you see in this video frame with maximum detail. '
@@ -3763,7 +4265,7 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
                             _textField(
                               _answerController,
                               _isMultipleChoice
-                                  ? 'Correct choice numbers'
+                                  ? 'Correct answer'
                                   : _unanswerable
                                       ? 'Answer (ignored for unanswerable)'
                                       : 'Answer',
@@ -4086,7 +4588,7 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
       case 'numeric':
         return num.tryParse(value) ?? value;
       case 'multiple_choice':
-        return _correctChoicesText();
+        return _correctChoiceAnswerText();
       default:
         return value;
     }
@@ -4119,12 +4621,22 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
       return;
     }
     _selectedCorrectChoices.removeWhere((value) => value < 1 || value > _choiceControllers.length);
-    _answerController.text = _correctChoicesText();
+    _answerController.text = _correctChoiceAnswerText();
   }
 
-  String _correctChoicesText() {
+  String _correctChoiceNumbersText() {
     final selected = _selectedCorrectChoices.toList()..sort();
     return selected.join(',');
+  }
+
+  String _correctChoiceAnswerText() {
+    final choices = _choiceTexts();
+    final selected = _selectedCorrectChoices.toList()..sort();
+    final selectedTexts = [
+      for (final index in selected)
+        if (index >= 1 && index <= choices.length) choices[index - 1],
+    ];
+    return selectedTexts.isEmpty ? _correctChoiceNumbersText() : selectedTexts.join(', ');
   }
 
   List<String> _choiceTexts() => _choiceControllers
@@ -4139,13 +4651,33 @@ class _AnnotationDialogState extends State<_AnnotationDialog> {
     if (answer is num) {
       return [answer.toInt()];
     }
-    return answer
+    final rawParts = answer
         .toString()
         .split(',')
-        .map((item) => int.tryParse(item.trim()))
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toList(growable: false);
+    final numericChoices = rawParts
+        .map(int.tryParse)
         .whereType<int>()
         .where((value) => value >= 1 && value <= 5)
         .toList(growable: false);
+    if (numericChoices.isNotEmpty) {
+      return numericChoices;
+    }
+    final normalizedChoices = [
+      for (final choice in _choiceTexts()) _normalizeMultipleChoiceAnswer(choice),
+    ];
+    return rawParts
+        .map(_normalizeMultipleChoiceAnswer)
+        .map((answerText) => normalizedChoices.indexOf(answerText))
+        .where((index) => index >= 0)
+        .map((index) => index + 1)
+        .toList(growable: false);
+  }
+
+  String _normalizeMultipleChoiceAnswer(String value) {
+    return value.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
   List<String> _csvList(String value) => value
