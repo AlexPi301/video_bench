@@ -164,6 +164,7 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
                 _InfoChip(label: 'Model', value: run.model),
                 _InfoChip(label: 'Frame sample rate', value: '${run.frameSampleRate}'),
                 _InfoChip(label: 'Save sample frames', value: run.saveSampleFrames ? 'yes' : 'no'),
+                _InfoChip(label: 'Batch same evidence spans', value: run.batchSameEvidenceSpans ? 'yes' : 'no'),
                 _InfoChip(label: 'QA files', value: '${run.qaFiles.length}'),
                 _InfoChip(label: 'Output', value: '${run.outputFolder}/${run.id}'),
               ],
@@ -383,6 +384,7 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
   late final TextEditingController _outputFolderController;
   List<String> _qaFiles = const [];
   var _saveSampleFrames = false;
+  var _batchSameEvidenceSpans = true;
 
   @override
   void initState() {
@@ -399,6 +401,7 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
     _outputFolderController = TextEditingController(text: run?.outputFolder ?? 'benchmark_runs');
     _qaFiles = run?.qaFiles ?? const [];
     _saveSampleFrames = run?.saveSampleFrames ?? false;
+    _batchSameEvidenceSpans = run?.batchSameEvidenceSpans ?? true;
   }
 
   @override
@@ -466,6 +469,13 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
                         subtitle: const Text('Store each sampled frame in this benchmark run\'s frames directory.'),
                         value: _saveSampleFrames,
                         onChanged: (value) => setState(() => _saveSampleFrames = value),
+                      ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Batch process QA Pairs with same evicende spans'),
+                        subtitle: const Text('Send QA pairs with identical evidence start/end seconds for the same video in one LLM request.'),
+                        value: _batchSameEvidenceSpans,
+                        onChanged: (value) => setState(() => _batchSameEvidenceSpans = value),
                       ),
                       const SizedBox(height: 12),
                       _field(_outputFolderController, 'output folder', readOnly: true),
@@ -536,6 +546,7 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
         lmStudioUrl: _lmStudioUrlController.text.trim(),
         frameSampleRate: frameSampleRate,
         saveSampleFrames: _saveSampleFrames,
+        batchSameEvidenceSpans: _batchSameEvidenceSpans,
         outputFolder: _outputFolderController.text.trim().isEmpty ? 'benchmark_runs' : _outputFolderController.text.trim(),
         qaFiles: _qaFiles,
       ));
@@ -550,6 +561,7 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
       model: _modelController.text.trim(),
       frameSampleRate: frameSampleRate,
       saveSampleFrames: _saveSampleFrames,
+      batchSameEvidenceSpans: _batchSameEvidenceSpans,
       outputFolder: _outputFolderController.text.trim().isEmpty ? 'benchmark_runs' : _outputFolderController.text.trim(),
       qaFiles: _qaFiles,
     ));

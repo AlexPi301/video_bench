@@ -13,6 +13,7 @@ class BenchmarkCreateRequest {
     required this.model,
     required this.frameSampleRate,
     required this.saveSampleFrames,
+    required this.batchSameEvidenceSpans,
     required this.outputFolder,
     required this.qaFiles,
   });
@@ -25,6 +26,7 @@ class BenchmarkCreateRequest {
   final String model;
   final int frameSampleRate;
   final bool saveSampleFrames;
+  final bool batchSameEvidenceSpans;
   final String outputFolder;
   final List<String> qaFiles;
 
@@ -37,6 +39,7 @@ class BenchmarkCreateRequest {
         'model': model,
         'frameSampleRate': frameSampleRate,
         'saveSampleFrames': saveSampleFrames,
+        'batchSameEvidenceSpans': batchSameEvidenceSpans,
         'outputFolder': outputFolder,
         'qaFiles': qaFiles,
       };
@@ -51,6 +54,7 @@ class BenchmarkUpdateRequest {
     required this.lmStudioUrl,
     required this.frameSampleRate,
     required this.saveSampleFrames,
+    required this.batchSameEvidenceSpans,
     required this.outputFolder,
     required this.qaFiles,
   });
@@ -62,6 +66,7 @@ class BenchmarkUpdateRequest {
   final String lmStudioUrl;
   final int frameSampleRate;
   final bool saveSampleFrames;
+  final bool batchSameEvidenceSpans;
   final String outputFolder;
   final List<String> qaFiles;
 
@@ -73,6 +78,7 @@ class BenchmarkUpdateRequest {
         'lmStudioUrl': lmStudioUrl,
         'frameSampleRate': frameSampleRate,
         'saveSampleFrames': saveSampleFrames,
+        'batchSameEvidenceSpans': batchSameEvidenceSpans,
         'outputFolder': outputFolder,
         'qaFiles': qaFiles,
       };

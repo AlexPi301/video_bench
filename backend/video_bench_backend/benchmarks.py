@@ -237,6 +237,7 @@ def create_benchmark_run(request: HttpRequest) -> JsonResponse:
         "model": str(payload.get("model") or "google/gemma-4-31b").strip(),
         "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
         "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
+        "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
         "output_folder": output_folder,
         "qa_files": qa_files,
         "status": "created",
@@ -289,6 +290,7 @@ def update_benchmark_run(request: HttpRequest, run_id: str) -> JsonResponse:
             "lm_studio_url": str(payload.get("lmStudioUrl") or "http://host.docker.internal:1234/v1").strip(),
             "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
             "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
+            "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
             "output_folder": output_folder,
             "qa_files": qa_files,
             "updated_at": _now_iso(),
@@ -451,38 +453,62 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
     run_id = str(run.get("id") or "")
     questions = _load_all_questions(list(run.get("qa_files") or []))
     total = len(questions)
-    resume_index = _resume_index_from_events(run_id, questions) if resume else 0
-    percent = round(resume_index * 100 / max(1, total))
-    _update_run(run_id, progress={"processedQuestions": resume_index, "totalQuestions": total, "percent": percent})
+    batch_same_evidence_spans = bool(run.get("batch_same_evidence_spans", True))
+    completed_qa_ids = _completed_qa_ids_from_results(_results_path(run_id)) if resume and batch_same_evidence_spans else set()
+    resume_index = _resume_index_from_events(run_id, questions) if resume and not batch_same_evidence_spans else 0
+    processed_indices = {
+        index
+        for index, item in enumerate(questions)
+        if str(item.get("id") or item.get("qa_id") or "") in completed_qa_ids
+    } if completed_qa_ids else set(range(resume_index))
+    processed_count = len(processed_indices)
+    percent = round(processed_count * 100 / max(1, total))
+    _update_run(run_id, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
     if resume:
-        _append_event(run_id, "qa_loaded", f"Loaded {total} benchmark question(s). Resuming at question {min(resume_index + 1, total + 1)}/{total}.")
+        _append_event(run_id, "qa_loaded", f"Loaded {total} benchmark question(s). Resuming after {processed_count} completed question(s).")
     else:
         _append_event(run_id, "qa_loaded", f"Loaded {total} benchmark question(s).")
 
     results_path = _results_path(run_id)
     results_path.parent.mkdir(parents=True, exist_ok=True)
-    if resume:
+    if resume and not batch_same_evidence_spans:
         _trim_results_for_resume(results_path, resume_index)
     mode = "a" if resume else "w"
     with results_path.open(mode, encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS)
         if mode == "w":
             writer.writeheader()
-        for index, item in enumerate(questions[resume_index:], start=resume_index + 1):
+        index = 0 if batch_same_evidence_spans else resume_index
+        while index < total:
+            if index in processed_indices:
+                index += 1
+                continue
+            item = questions[index]
             if cancel_event.is_set():
                 _update_run(run_id, status="cancelled")
                 _append_event(run_id, "cancelled", "Benchmark execution cancelled.")
                 return
             qa_id = str(item.get("id") or item.get("qa_id") or "")
             try:
-                row = _answer_question(cv2, litellm, run, item)
+                if batch_same_evidence_spans:
+                    batch_indices = _batch_indices_for_same_evidence_span(questions, processed_indices, index)
+                    rows = _answer_questions_batch(cv2, litellm, run, [questions[item_index] for item_index in batch_indices])
+                else:
+                    batch_indices = [index]
+                    rows = [_answer_question(cv2, litellm, run, item)]
             except Exception as exc:
                 raise RuntimeError(f"Failed processing QA pair {qa_id or '<unknown>'}: {exc}") from exc
-            writer.writerow(row)
-            handle.flush()
-            percent = round(index * 100 / max(1, total))
-            _update_run(run_id, progress={"processedQuestions": index, "totalQuestions": total, "percent": percent})
-            _append_event(run_id, "question_done", f"Answered question {index}/{total}.", qaId=row["qa_id"], percent=percent)
+            if len(rows) != len(batch_indices):
+                raise RuntimeError(f"Benchmark batch returned {len(rows)} answer(s) for {len(batch_indices)} QA pair(s).")
+            for item_index, row in zip(batch_indices, rows):
+                writer.writerow(row)
+                processed_indices.add(item_index)
+                handle.flush()
+                processed_count = len(processed_indices)
+                percent = round(processed_count * 100 / max(1, total))
+                _update_run(run_id, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
+                _append_event(run_id, "question_done", f"Answered question {processed_count}/{total}.", qaId=row["qa_id"], percent=percent)
+            index += 1
 
 
 def _resume_index_from_events(run_id: str, questions: list[dict[str, Any]]) -> int:
@@ -542,6 +568,32 @@ def _load_all_questions(qa_files: list[str]) -> list[dict[str, Any]]:
     return items
 
 
+def _batch_indices_for_same_evidence_span(questions: list[dict[str, Any]], processed_indices: set[int], first_index: int) -> list[int]:
+    first_key = _batch_evidence_key(questions[first_index])
+    if first_key is None:
+        return [first_index]
+    indices = [first_index]
+    for index in range(first_index + 1, len(questions)):
+        if index in processed_indices:
+            continue
+        if _batch_evidence_key(questions[index]) == first_key:
+            indices.append(index)
+    return indices
+
+
+def _batch_evidence_key(item: dict[str, Any]) -> tuple[str, float, float] | None:
+    spans = list(item.get("evidence_spans") or [])
+    if not spans or not isinstance(spans[0], dict):
+        return None
+    span = spans[0]
+    try:
+        start = float(span.get("start_seconds"))
+        end = float(span.get("end_seconds"))
+    except Exception:
+        return None
+    return (_normalized_qa_video_id(item), start, end)
+
+
 def _answer_question(cv2: Any, litellm: Any, run: dict[str, Any], item: dict[str, Any]) -> dict[str, str]:
     video_path = _resolve_video_path(item)
     if bool(run.get("save_sample_frames", False)):
@@ -554,6 +606,23 @@ def _answer_question(cv2: Any, litellm: Any, run: dict[str, Any], item: dict[str
             return _complete_answer(litellm, run, item, messages)
 
     return _complete_answer(litellm, run, item, messages)
+
+
+def _answer_questions_batch(cv2: Any, litellm: Any, run: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, str]]:
+    if len(items) <= 1:
+        return [_answer_question(cv2, litellm, run, items[0])]
+    video_path = _resolve_video_path(items[0])
+    frame_dir = _run_dir(str(run.get("id") or "")) / "frames"
+    if bool(run.get("save_sample_frames", False)):
+        frame_paths = _sample_evidence_frames(cv2, video_path, items[0], int(run.get("frame_sample_rate") or 15), frame_dir)
+        messages = [{"role": "user", "content": _batch_prompt_content(items, frame_paths)}]
+    else:
+        with tempfile.TemporaryDirectory(prefix="video-bench-frames-") as tmp_dir:
+            frame_paths = _sample_evidence_frames(cv2, video_path, items[0], int(run.get("frame_sample_rate") or 15), Path(tmp_dir))
+            messages = [{"role": "user", "content": _batch_prompt_content(items, frame_paths)}]
+            return _complete_answers_batch(litellm, run, items, messages)
+
+    return _complete_answers_batch(litellm, run, items, messages)
 
 
 def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, str]:
@@ -571,6 +640,53 @@ def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], me
     raw_answer = _completion_text(response)
     parsed = _parse_model_answer(raw_answer)
     correct = _score_answer(item, parsed)
+    return {
+        "qa_id": str(item.get("id") or item.get("qa_id") or ""),
+        "video_id": _normalized_qa_video_id(item),
+        "question": str(item.get("question") or ""),
+        "answer_format": str(item.get("answer_format") or ""),
+        "family": str(item.get("family") or ""),
+        "reasoning_types": ",".join(str(x) for x in list(item.get("reasoning_types") or [])),
+        "difficulty": str(item.get("difficulty") or ""),
+        "visibility": str(item.get("visibility") or ""),
+        "day_night": str(item.get("day_night") or ""),
+        "unanswerable_gt": _bool_text(bool(item.get("unanswerable", False))),
+        "ground_truth_resolved": _answer_text(item.get("answer")),
+        "model": model,
+        "raw_model_answer": raw_answer,
+        "parsed_model_answer": _answer_text(parsed.get("answer")),
+        "is_correct": _bool_text(correct),
+        "score_method": "rule_based",
+        "model_declared_unanswerable": _bool_text(bool(parsed.get("unanswerable", False))),
+    }
+
+
+def _complete_answers_batch(litellm: Any, run: dict[str, Any], items: list[dict[str, Any]], messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    model = str(run.get("model") or "").strip()
+    litellm_model = model if model.startswith("openai/") else f"openai/{model}"
+    response = litellm.completion(
+        model=litellm_model,
+        api_base=str(run.get("lm_studio_url") or "").strip(),
+        api_key="lm-studio",
+        messages=messages,
+        temperature=0,
+        max_tokens=max(MAX_TOKENS, 400 * len(items)),
+        timeout=REQUEST_TIMEOUT_SEC,
+    )
+    raw_answer = _completion_text(response)
+    parsed_answers = _parse_model_answers_batch(raw_answer, items)
+    rows: list[dict[str, str]] = []
+    for item in items:
+        qa_id = str(item.get("id") or item.get("qa_id") or "")
+        parsed = parsed_answers.get(qa_id)
+        if parsed is None:
+            raise RuntimeError(f"Batched model response did not include an answer for QA pair {qa_id or '<unknown>'}.")
+        correct = _score_answer(item, parsed)
+        rows.append(_benchmark_result_row(item, model, raw_answer, parsed, correct))
+    return rows
+
+
+def _benchmark_result_row(item: dict[str, Any], model: str, raw_answer: str, parsed: dict[str, Any], correct: bool) -> dict[str, str]:
     return {
         "qa_id": str(item.get("id") or item.get("qa_id") or ""),
         "video_id": _normalized_qa_video_id(item),
@@ -682,6 +798,32 @@ def _prompt_content(item: dict[str, Any], frame_paths: list[Path]) -> list[dict[
     return content
 
 
+def _batch_prompt_content(items: list[dict[str, Any]], frame_paths: list[Path]) -> list[dict[str, Any]]:
+    questions = []
+    for item in items:
+        questions.append({
+            "qa_id": str(item.get("id") or item.get("qa_id") or ""),
+            "question": str(item.get("question") or ""),
+            "answer_format": str(item.get("answer_format") or "open_ended"),
+            "choices": list(item.get("choices") or []),
+        })
+    prompt = (
+        "You are evaluating benchmark questions against one shared set of sampled frames from the same video evidence span. "
+        "Answer every question only from the provided frames. If the frames do not contain enough evidence for a question, mark that question unanswerable.\n\n"
+        f"Questions: {json.dumps(questions, ensure_ascii=True)}\n\n"
+        "Return exactly one JSON object with this schema and no markdown:\n"
+        "{\"answers\": [{\"qa_id\": <string>, \"answer\": <string|number|boolean|null>, \"unanswerable\": <true|false>}]}\n"
+        "Return one answers item for every qa_id. For yes_no, use true for yes and false for no. "
+        "For multiple_choice, answer with one of that question's choices exactly. For numeric, answer with only the number."
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for path in frame_paths:
+        with path.open("rb") as handle:
+            image_b64 = base64.b64encode(handle.read()).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+    return content
+
+
 def _parse_model_answer(raw: str) -> dict[str, Any]:
     text = raw.strip()
     match = re.search(r"\{.*\}", text, flags=re.S)
@@ -700,6 +842,26 @@ def _parse_model_answer(raw: str) -> dict[str, Any]:
     if lowered in {"no", "false"}:
         return {"answer": False, "unanswerable": False}
     return {"answer": text, "unanswerable": False}
+
+
+def _parse_model_answers_batch(raw: str, items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    text = raw.strip()
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        raise RuntimeError("Batched model response did not contain a JSON object.")
+    payload = json.loads(match.group(0))
+    if not isinstance(payload, dict) or not isinstance(payload.get("answers"), list):
+        raise RuntimeError("Batched model response must contain an answers list.")
+    expected_ids = {str(item.get("id") or item.get("qa_id") or "") for item in items}
+    parsed: dict[str, dict[str, Any]] = {}
+    for answer_item in payload["answers"]:
+        if not isinstance(answer_item, dict):
+            continue
+        qa_id = str(answer_item.get("qa_id") or answer_item.get("id") or "")
+        if qa_id not in expected_ids:
+            continue
+        parsed[qa_id] = {"answer": answer_item.get("answer"), "unanswerable": bool(answer_item.get("unanswerable", False))}
+    return parsed
 
 
 def _score_answer(item: dict[str, Any], parsed: dict[str, Any]) -> bool:
@@ -766,6 +928,13 @@ def _result_count(path: Path) -> int:
         return 0
     with path.open("r", encoding="utf-8", newline="") as handle:
         return max(0, sum(1 for _ in handle) - 1)
+
+
+def _completed_qa_ids_from_results(path: Path) -> set[str]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return set()
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return {str(row.get("qa_id") or "") for row in csv.DictReader(handle) if str(row.get("qa_id") or "")}
 
 
 def _import_required(module_name: str, message: str) -> Any:

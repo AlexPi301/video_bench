@@ -9,6 +9,7 @@ class BenchmarkRun {
     required this.model,
     required this.frameSampleRate,
     required this.saveSampleFrames,
+    required this.batchSameEvidenceSpans,
     required this.outputFolder,
     required this.qaFiles,
     required this.status,
@@ -28,6 +29,7 @@ class BenchmarkRun {
   final String model;
   final int frameSampleRate;
   final bool saveSampleFrames;
+  final bool batchSameEvidenceSpans;
   final String outputFolder;
   final List<String> qaFiles;
   final String status;
@@ -50,6 +52,7 @@ class BenchmarkRun {
       model: json['model']?.toString() ?? '',
       frameSampleRate: _int(json['frame_sample_rate'] ?? json['frameSampleRate']),
       saveSampleFrames: json['save_sample_frames'] == true || json['saveSampleFrames'] == true,
+      batchSameEvidenceSpans: json['batch_same_evidence_spans'] != false && json['batchSameEvidenceSpans'] != false,
       outputFolder: json['output_folder']?.toString() ?? json['outputFolder']?.toString() ?? '',
       qaFiles: _stringList(json['qa_files'] ?? json['qaFiles']),
       status: json['status']?.toString() ?? 'unknown',
