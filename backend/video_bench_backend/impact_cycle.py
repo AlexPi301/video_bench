@@ -1280,12 +1280,16 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
         existing_payload = _load_or_create_qa_pairs_payload(out_path, video_path, video_rel)
         qa_pairs = [dict(item) for item in list(existing_payload.get("qa_pairs") or []) if isinstance(item, dict)]
         next_qa_pair_id = _next_qa_pair_id(qa_pairs)
+        completed_windows = _completed_qa_window_indices(qa_pairs, total_windows=total_windows, window_size=window_size, duration_seconds=duration_seconds)
+        completed_count = len(completed_windows)
         job = _update_job(
             job_id,
-            progress={"processedFrames": 0, "totalFrames": total_windows, "percent": 0},
+            progress={"processedFrames": completed_count, "totalFrames": total_windows, "percent": round(completed_count * 100 / max(1, total_windows))},
             video={**dict(job.get("video") or {}), "name": video_path.name, "frameCount": frame_count, "sourceFps": source_fps},
         )
         _append_event(job, "qa_start", f"Generating QA pairs for {total_windows} window(s) of {video_path.name}.")
+        if completed_count:
+            _append_event(job, "qa_resume", f"Resuming QA-pair generation after {completed_count} completed window(s).")
 
         for window_index in range(total_windows):
             if cancel_event.is_set() or str(_load_job(job_id).get("status")) == "cancelled":
@@ -1295,6 +1299,9 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
                 return
             start_seconds = float(window_index * window_size)
             end_seconds = min(float((window_index + 1) * window_size), max(duration_seconds, start_seconds + window_size))
+            if window_index in completed_windows:
+                _append_event(job, "qa_window_done", f"Skipped completed QA-pair window {window_index + 1}/{total_windows}.")
+                continue
             frame_indices = _qa_window_frame_indices(source_fps, frame_count, start_seconds, end_seconds, fps_sampling)
             if not frame_indices:
                 frame_indices = [min(max(0, frame_count - 1), int(start_seconds * source_fps))]
@@ -1444,6 +1451,30 @@ def _run_qa_pairs_generate(job_id: str, cancel_event: threading.Event) -> None:
         _complete_workflow_job(job_id, "QA-pair generation completed.", [{"type": "qa_pairs", "name": "qa_pairs.json", "path": str(out_path)}])
     finally:
         cap.release()
+
+
+def _completed_qa_window_indices(qa_pairs: list[dict[str, Any]], *, total_windows: int, window_size: int, duration_seconds: float) -> set[int]:
+    completed: set[int] = set()
+    for window_index in range(total_windows):
+        start_seconds = float(window_index * window_size)
+        end_seconds = min(float((window_index + 1) * window_size), max(duration_seconds, start_seconds + window_size))
+        if any(_qa_pair_matches_window(pair, start_seconds, end_seconds) for pair in qa_pairs):
+            completed.add(window_index)
+    return completed
+
+
+def _qa_pair_matches_window(pair: dict[str, Any], start_seconds: float, end_seconds: float) -> bool:
+    for span in list(pair.get("evidence_spans") or []):
+        if not isinstance(span, dict):
+            continue
+        try:
+            span_start = float(span.get("start_seconds"))
+            span_end = float(span.get("end_seconds"))
+        except Exception:
+            continue
+        if abs(span_start - start_seconds) <= 0.001 and abs(span_end - end_seconds) <= 0.001:
+            return True
+    return False
 
 
 def _qa_window_frame_indices(source_fps: float, frame_count: int, start_seconds: float, end_seconds: float, fps_sampling: int) -> list[int]:

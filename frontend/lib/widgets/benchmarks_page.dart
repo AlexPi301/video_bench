@@ -22,6 +22,7 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
   int _eventCursor = 0;
   String? _error;
   var _loading = true;
+  var _countBlacklistedQaPairs = false;
 
   @override
   void initState() {
@@ -133,6 +134,7 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
     if (run == null) {
       return const Card(child: Center(child: Text('Select a benchmark run.')));
     }
+    final metrics = _countBlacklistedQaPairs ? run.metricsIncludingBlacklisted : run.metrics;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(20),
@@ -180,13 +182,23 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
               Text(run.error, style: TextStyle(color: Theme.of(context).colorScheme.error)),
             ],
             const SizedBox(height: 20),
+            Text('Details', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Text('Processed QA pairs: ${run.details.processedQaPairs} (plus skipped QA pairs: ${run.details.skippedBlacklistedQaPairs})'),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('count blacklisted QA pairs'),
+              value: _countBlacklistedQaPairs,
+              onChanged: (value) => setState(() => _countBlacklistedQaPairs = value),
+            ),
+            const SizedBox(height: 12),
             Text('Metrics', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 10),
-            _MetricRow(name: 'Total correct', bucket: run.metrics.total),
+            _MetricRow(name: 'Total correct', bucket: metrics.total),
             const SizedBox(height: 8),
-            _MetricSection(title: 'Correct by family', buckets: run.metrics.byFamily),
+            _MetricSection(title: 'Correct by family', buckets: metrics.byFamily),
             const SizedBox(height: 8),
-            _MetricSection(title: 'Correct by day/night', buckets: run.metrics.dayNight),
+            _MetricSection(title: 'Correct by day/night', buckets: metrics.dayNight),
             const SizedBox(height: 14),
             Text('QA files', style: Theme.of(context).textTheme.titleSmall),
             const SizedBox(height: 6),

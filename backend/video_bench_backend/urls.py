@@ -7,14 +7,19 @@ from django.urls import path
 
 from .benchmarks import (
     create_benchmark_run,
+    delete_qa_pair,
     delete_benchmark_run,
+    get_always_wrong_qa_pairs,
     get_benchmark_results,
     get_benchmark_run,
     get_benchmark_run_events,
+    get_qa_pair_blacklist,
     list_benchmark_runs,
     resume_benchmark_run,
+    set_qa_pair_blacklist,
     start_benchmark_run,
     update_benchmark_run,
+    update_qa_pair,
 )
 from .impact_cycle import (
     cancel_impact_cycle_job,
@@ -40,6 +45,11 @@ urlpatterns = [
     path("api/benchmarks/runs/<str:run_id>/resume/", resume_benchmark_run, name="benchmarks-run-resume"),
     path("api/benchmarks/runs/<str:run_id>/events/", get_benchmark_run_events, name="benchmarks-run-events"),
     path("api/benchmarks/runs/<str:run_id>/results/", get_benchmark_results, name="benchmarks-run-results"),
+    path("api/qa-pairs/always-wrong/", get_always_wrong_qa_pairs, name="qa-pairs-always-wrong"),
+    path("api/qa-pairs/blacklist/", get_qa_pair_blacklist, name="qa-pairs-blacklist"),
+    path("api/qa-pairs/blacklist/set/", set_qa_pair_blacklist, name="qa-pairs-blacklist-set"),
+    path("api/qa-pairs/update/", update_qa_pair, name="qa-pairs-update"),
+    path("api/qa-pairs/delete/", delete_qa_pair, name="qa-pairs-delete"),
     path("api/mounted-files/", list_mounted_files, name="mounted-files-list"),
     path("api/mounted-files/file/", serve_mounted_file, name="mounted-files-file"),
     path("api/mounted-files/save/", save_mounted_file, name="mounted-files-save"),

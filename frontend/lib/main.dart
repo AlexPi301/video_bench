@@ -4,6 +4,7 @@ import 'package:flutter/rendering.dart';
 import 'services/devtools_agent_bridge.dart';
 import 'widgets/benchmarks_page.dart';
 import 'widgets/impact_cycle_page.dart';
+import 'widgets/qa_pairs_page.dart';
 import 'widgets/video_bench_page.dart';
 
 const _experimentalEnabled = bool.fromEnvironment('VIDEO_BENCH_EXPERIMENTAL');
@@ -81,10 +82,17 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
         actions: [
           if (_experimentalEnabled)
             _NavButton(
-              identifier: 'app.nav.benchmarks',
-              label: 'Benchmarks',
+              identifier: 'app.nav.qa-pairs',
+              label: 'QA Pairs',
               selected: _selectedIndex == 1,
               onPressed: () => _selectPage(1),
+            ),
+          if (_experimentalEnabled)
+            _NavButton(
+              identifier: 'app.nav.benchmarks',
+              label: 'Benchmarks',
+              selected: _selectedIndex == 2,
+              onPressed: () => _selectPage(2),
             ),
           _NavButton(
             identifier: 'app.nav.video-bench',
@@ -96,8 +104,8 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
             _NavButton(
               identifier: 'app.nav.impact-cycle',
               label: 'Impact Cycle',
-              selected: _selectedIndex == 2,
-              onPressed: () => _selectPage(2),
+              selected: _selectedIndex == 3,
+              onPressed: () => _selectPage(3),
             ),
           const SizedBox(width: 12),
         ],
@@ -106,6 +114,7 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
         index: _stackIndex,
         children: const [
           VideoBenchPage(),
+          if (_experimentalEnabled) QaPairsPage(),
           if (_experimentalEnabled) BenchmarksPage(),
           if (_experimentalEnabled) ImpactCyclePage(),
         ],
@@ -130,16 +139,21 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
         if (!_experimentalEnabled) {
           throw StateError('Impact Cycle is not enabled in this build.');
         }
-        _selectPage(2);
+        _selectPage(3);
       } else if (page == 'benchmarks') {
         if (!_experimentalEnabled) {
           throw StateError('Benchmarks is not enabled in this build.');
+        }
+        _selectPage(2);
+      } else if (page == 'qaPairs') {
+        if (!_experimentalEnabled) {
+          throw StateError('QA Pairs is not enabled in this build.');
         }
         _selectPage(1);
       } else if (page == 'videoBench') {
         _selectPage(0);
       } else {
-        throw ArgumentError('Expected page to be "videoBench", "benchmarks", or "impactCycle".');
+        throw ArgumentError('Expected page to be "videoBench", "qaPairs", "benchmarks", or "impactCycle".');
       }
       return bridge.state;
     });
@@ -154,9 +168,12 @@ class _VideoBenchShellState extends State<_VideoBenchShell> {
 
   String get _selectedPageName {
     if (_selectedIndex == 1) {
-      return _experimentalEnabled ? 'benchmarks' : 'videoBench';
+      return _experimentalEnabled ? 'qaPairs' : 'videoBench';
     }
     if (_selectedIndex == 2) {
+      return _experimentalEnabled ? 'benchmarks' : 'videoBench';
+    }
+    if (_selectedIndex == 3) {
       return _experimentalEnabled ? 'impactCycle' : 'videoBench';
     }
     return 'videoBench';

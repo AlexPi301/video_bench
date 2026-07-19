@@ -102,6 +102,10 @@ def _results_path(run_id: str) -> Path:
     return _run_dir(run_id) / "results.csv"
 
 
+def _blacklist_path() -> Path:
+    return _mounted_root() / "qa_pair_blacklist.json"
+
+
 def _events_path(run_id: str) -> Path:
     return _run_dir(run_id) / "events.jsonl"
 
@@ -374,7 +378,11 @@ def get_benchmark_run_events(request: HttpRequest, run_id: str) -> JsonResponse:
 def _run_response(run: dict[str, Any]) -> dict[str, Any]:
     out = dict(run)
     out.pop("run_dir", None)
-    out["metrics"] = _calculate_metrics(_results_path(str(run.get("id") or "")))
+    blacklisted_ids = _blacklisted_qa_ids_for_run(run)
+    out["metrics"] = _calculate_metrics(_results_path(str(run.get("id") or "")), blacklisted_ids=blacklisted_ids)
+    out["metricsIncludingBlacklisted"] = _calculate_metrics(_results_path(str(run.get("id") or "")), blacklisted_ids=set())
+    processed_count = _result_count_excluding(_results_path(str(run.get("id") or "")), blacklisted_ids)
+    out["details"] = {"processedQaPairs": processed_count, "skippedBlacklistedQaPairs": len(blacklisted_ids)}
     out["canStart"] = _can_start(run)
     out["canResume"] = _can_resume(run)
     out["resultsUrl"] = f"/api/benchmarks/runs/{run.get('id')}/results/"
@@ -392,6 +400,131 @@ def get_benchmark_results(_request: HttpRequest, run_id: str) -> JsonResponse:
     return JsonResponse({"rows": rows})
 
 
+@csrf_exempt
+@require_POST
+def get_always_wrong_qa_pairs(request: HttpRequest) -> JsonResponse:
+    try:
+        payload = _json_request(request)
+    except Exception as exc:
+        return JsonResponse({"error": f"Invalid JSON body: {exc}"}, status=400)
+    selected_ids = {str(item).strip() for item in list(payload.get("runIds") or []) if str(item).strip()}
+    runs = [run for run in _all_runs() if not selected_ids or str(run.get("id") or "") in selected_ids]
+    stats: dict[str, dict[str, Any]] = {}
+    qa_lookup: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        for qa_file in list(run.get("qa_files") or []):
+            for pair in _load_qa_pairs_from_file(str(qa_file)):
+                qa_id = str(pair.get("id") or pair.get("qa_id") or "")
+                if qa_id:
+                    qa_lookup.setdefault(qa_id, {"qaFile": qa_file, "qaPair": pair})
+        results_path = _results_path(str(run.get("id") or ""))
+        if not results_path.is_file():
+            continue
+        with results_path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                qa_id = str(row.get("qa_id") or "")
+                if not qa_id:
+                    continue
+                stat = stats.setdefault(qa_id, {"attempts": 0, "correct": 0, "runs": set()})
+                stat["attempts"] += 1
+                stat["runs"].add(str(run.get("id") or ""))
+                if str(row.get("is_correct") or "").lower() == "true":
+                    stat["correct"] += 1
+    blacklist = _load_blacklist_entries()
+    items = []
+    for qa_id, stat in sorted(stats.items(), key=lambda entry: str(entry[0])):
+        if int(stat.get("attempts") or 0) <= 0 or int(stat.get("correct") or 0) > 0:
+            continue
+        qa_info = qa_lookup.get(qa_id)
+        if not qa_info:
+            continue
+        qa_file = str(qa_info.get("qaFile") or "")
+        pair = dict(qa_info.get("qaPair") or {})
+        items.append({
+            "qaFile": qa_file,
+            "qaPair": pair,
+            "attempts": int(stat.get("attempts") or 0),
+            "runIds": sorted(str(item) for item in stat.get("runs") or []),
+            "blacklisted": _qa_pair_is_blacklisted(blacklist, qa_file, pair),
+        })
+    return JsonResponse({"items": items})
+
+
+@require_GET
+def get_qa_pair_blacklist(_request: HttpRequest) -> JsonResponse:
+    return JsonResponse({"entries": _load_blacklist_entries()})
+
+
+@csrf_exempt
+@require_POST
+def set_qa_pair_blacklist(request: HttpRequest) -> JsonResponse:
+    try:
+        payload = _json_request(request)
+    except Exception as exc:
+        return JsonResponse({"error": f"Invalid JSON body: {exc}"}, status=400)
+    qa_file = str(payload.get("qaFile") or "").strip()
+    qa_pair = dict(payload.get("qaPair") or {})
+    blacklisted = _bool_payload(payload, "blacklisted")
+    entries = _load_blacklist_entries()
+    key = _qa_pair_blacklist_key(qa_file, qa_pair)
+    entries = [entry for entry in entries if _blacklist_entry_key(entry) != key]
+    if blacklisted:
+        entries.append({
+            "qa_file": qa_file,
+            "qa_id": str(qa_pair.get("id") or qa_pair.get("qa_id") or ""),
+            "video_id": str(qa_pair.get("video_id") or ""),
+            "question": str(qa_pair.get("question") or ""),
+            "blacklisted_at": _now_iso(),
+        })
+    _write_json_atomic(_blacklist_path(), {"entries": entries})
+    return JsonResponse({"entries": entries, "blacklisted": blacklisted})
+
+
+@csrf_exempt
+@require_POST
+def update_qa_pair(request: HttpRequest) -> JsonResponse:
+    try:
+        payload = _json_request(request)
+    except Exception as exc:
+        return JsonResponse({"error": f"Invalid JSON body: {exc}"}, status=400)
+    qa_file = str(payload.get("qaFile") or "").strip()
+    qa_pair = dict(payload.get("qaPair") or {})
+    qa_id = str(payload.get("qaId") or qa_pair.get("id") or qa_pair.get("qa_id") or "").strip()
+    if not qa_file or not qa_id:
+        return JsonResponse({"error": "qaFile and qaPair.id are required."}, status=400)
+    path = _safe_resolve(_mounted_root(), qa_file)
+    payload_json = _load_qa_payload(path)
+    pairs = _qa_pairs_list(payload_json)
+    for index, pair in enumerate(pairs):
+        if str(pair.get("id") or pair.get("qa_id") or "") == qa_id:
+            pairs[index] = qa_pair
+            _write_json_atomic(path, payload_json)
+            return JsonResponse({"qaFile": qa_file, "qaPair": qa_pair})
+    return JsonResponse({"error": f"QA pair {qa_id} not found."}, status=404)
+
+
+@csrf_exempt
+@require_POST
+def delete_qa_pair(request: HttpRequest) -> JsonResponse:
+    try:
+        payload = _json_request(request)
+    except Exception as exc:
+        return JsonResponse({"error": f"Invalid JSON body: {exc}"}, status=400)
+    qa_file = str(payload.get("qaFile") or "").strip()
+    qa_id = str(payload.get("qaId") or "").strip()
+    if not qa_file or not qa_id:
+        return JsonResponse({"error": "qaFile and qaId are required."}, status=400)
+    path = _safe_resolve(_mounted_root(), qa_file)
+    payload_json = _load_qa_payload(path)
+    pairs = _qa_pairs_list(payload_json)
+    original_len = len(pairs)
+    pairs[:] = [pair for pair in pairs if str(pair.get("id") or pair.get("qa_id") or "") != qa_id]
+    if len(pairs) == original_len:
+        return JsonResponse({"error": f"QA pair {qa_id} not found."}, status=404)
+    _write_json_atomic(path, payload_json)
+    return JsonResponse({"deleted": True, "qaFile": qa_file, "qaId": qa_id})
+
+
 def _can_start(run: dict[str, Any]) -> bool:
     run_id = str(run.get("id") or "")
     if run_id in _RUNNING or str(run.get("status")) != "created":
@@ -405,12 +538,12 @@ def _can_resume(run: dict[str, Any]) -> bool:
     return run_id not in _RUNNING and str(run.get("status")) == "failed"
 
 
-def _calculate_metrics(path: Path) -> dict[str, Any]:
+def _calculate_metrics(path: Path, *, blacklisted_ids: set[str]) -> dict[str, Any]:
     if not path.is_file() or path.stat().st_size == 0:
         return {"total": {"correct": 0, "count": 0, "percent": 0.0}, "byFamily": {}, "dayNight": {}}
     rows: list[dict[str, str]] = []
     with path.open("r", encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+        rows = [row for row in csv.DictReader(handle) if str(row.get("qa_id") or "") not in blacklisted_ids]
 
     def bucket_percent(bucket_rows: list[dict[str, str]]) -> dict[str, Any]:
         count = len(bucket_rows)
@@ -566,6 +699,68 @@ def _load_all_questions(qa_files: list[str]) -> list[dict[str, Any]]:
                 item["_qa_file"] = rel_path
                 items.append(item)
     return items
+
+
+def _load_qa_pairs_from_file(rel_path: str) -> list[dict[str, Any]]:
+    try:
+        payload = _load_qa_payload(_safe_resolve(_mounted_root(), rel_path))
+    except Exception:
+        return []
+    return [dict(item) for item in _qa_pairs_list(payload) if isinstance(item, dict)]
+
+
+def _load_qa_payload(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _qa_pairs_list(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict) and isinstance(payload.get("qa_pairs"), list):
+        return payload["qa_pairs"]
+    if isinstance(payload, list):
+        return payload
+    raise RuntimeError("QA file must contain a qa_pairs list.")
+
+
+def _load_blacklist_entries() -> list[dict[str, Any]]:
+    path = _blacklist_path()
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict) and isinstance(payload.get("entries"), list):
+            return [dict(item) for item in payload["entries"] if isinstance(item, dict)]
+        if isinstance(payload, list):
+            return [dict(item) for item in payload if isinstance(item, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def _blacklisted_qa_ids_for_run(run: dict[str, Any]) -> set[str]:
+    entries = _load_blacklist_entries()
+    blacklisted: set[str] = set()
+    for qa_file in list(run.get("qa_files") or []):
+        for pair in _load_qa_pairs_from_file(str(qa_file)):
+            if _qa_pair_is_blacklisted(entries, str(qa_file), pair):
+                qa_id = str(pair.get("id") or pair.get("qa_id") or "")
+                if qa_id:
+                    blacklisted.add(qa_id)
+    return blacklisted
+
+
+def _qa_pair_is_blacklisted(entries: list[dict[str, Any]], qa_file: str, qa_pair: dict[str, Any]) -> bool:
+    key = _qa_pair_blacklist_key(qa_file, qa_pair)
+    return any(_blacklist_entry_key(entry) == key for entry in entries)
+
+
+def _qa_pair_blacklist_key(qa_file: str, qa_pair: dict[str, Any]) -> tuple[str, str]:
+    return (str(qa_file or ""), str(qa_pair.get("id") or qa_pair.get("qa_id") or ""))
+
+
+def _blacklist_entry_key(entry: dict[str, Any]) -> tuple[str, str]:
+    return (str(entry.get("qa_file") or entry.get("qaFile") or ""), str(entry.get("qa_id") or entry.get("qaId") or ""))
 
 
 def _batch_indices_for_same_evidence_span(questions: list[dict[str, Any]], processed_indices: set[int], first_index: int) -> list[int]:
@@ -928,6 +1123,13 @@ def _result_count(path: Path) -> int:
         return 0
     with path.open("r", encoding="utf-8", newline="") as handle:
         return max(0, sum(1 for _ in handle) - 1)
+
+
+def _result_count_excluding(path: Path, excluded_qa_ids: set[str]) -> int:
+    if not path.is_file() or path.stat().st_size == 0:
+        return 0
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return sum(1 for row in csv.DictReader(handle) if str(row.get("qa_id") or "") not in excluded_qa_ids)
 
 
 def _completed_qa_ids_from_results(path: Path) -> set[str]:

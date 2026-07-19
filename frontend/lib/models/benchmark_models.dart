@@ -16,6 +16,8 @@ class BenchmarkRun {
     required this.progress,
     required this.error,
     required this.metrics,
+    required this.metricsIncludingBlacklisted,
+    required this.details,
     required this.canStart,
     required this.canResume,
   });
@@ -36,6 +38,8 @@ class BenchmarkRun {
   final BenchmarkProgress progress;
   final String error;
   final BenchmarkMetrics metrics;
+  final BenchmarkMetrics metricsIncludingBlacklisted;
+  final BenchmarkRunDetails details;
   final bool canStart;
   final bool canResume;
 
@@ -59,8 +63,24 @@ class BenchmarkRun {
       progress: BenchmarkProgress.fromJson(Map<String, dynamic>.from((json['progress'] as Map?) ?? const {})),
       error: json['error']?.toString() ?? '',
       metrics: BenchmarkMetrics.fromJson(Map<String, dynamic>.from((json['metrics'] as Map?) ?? const {})),
+      metricsIncludingBlacklisted: BenchmarkMetrics.fromJson(Map<String, dynamic>.from((json['metricsIncludingBlacklisted'] as Map?) ?? const {})),
+      details: BenchmarkRunDetails.fromJson(Map<String, dynamic>.from((json['details'] as Map?) ?? const {})),
       canStart: json['canStart'] == true,
       canResume: json['canResume'] == true,
+    );
+  }
+}
+
+class BenchmarkRunDetails {
+  const BenchmarkRunDetails({required this.processedQaPairs, required this.skippedBlacklistedQaPairs});
+
+  final int processedQaPairs;
+  final int skippedBlacklistedQaPairs;
+
+  factory BenchmarkRunDetails.fromJson(Map<String, dynamic> json) {
+    return BenchmarkRunDetails(
+      processedQaPairs: _int(json['processedQaPairs']),
+      skippedBlacklistedQaPairs: _int(json['skippedBlacklistedQaPairs']),
     );
   }
 }
