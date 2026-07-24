@@ -47,7 +47,9 @@ class BenchmarkRun {
   final bool canStart;
   final bool canResume;
 
-  bool get isRunning => status == 'queued' || status == 'running';
+  bool get isRunning => status == 'queued' || status == 'running' || status == 'pausing';
+
+  bool get canPause => status == 'queued' || status == 'running';
 
   factory BenchmarkRun.fromJson(Map<String, dynamic> json) {
     return BenchmarkRun(

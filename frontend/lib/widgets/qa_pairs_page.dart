@@ -133,14 +133,20 @@ class _QaPairsPageState extends State<QaPairsPage> {
           children: [
             Row(
               children: [
-                Expanded(child: Text('Always-wrong QA Pairs', style: Theme.of(context).textTheme.titleLarge)),
+                Expanded(child: Text('QA Pairs Without Correct Answers', style: Theme.of(context).textTheme.titleLarge)),
                 Text('${_alwaysWrong.length} item(s)', style: const TextStyle(color: Color(0xFF94A3B8))),
+                const SizedBox(width: 12),
+                FilledButton.tonalIcon(
+                  onPressed: _refreshing || _alwaysWrong.isEmpty ? null : _deleteAllItems,
+                  icon: const Icon(Icons.delete_sweep),
+                  label: const Text('Delete all'),
+                ),
               ],
             ),
             const SizedBox(height: 12),
             Expanded(
               child: _alwaysWrong.isEmpty
-                  ? const Center(child: Text('Refresh to find QA pairs that were never answered correctly.'))
+                  ? const Center(child: Text('Refresh to find available QA pairs with no correct answers in the selected runs.'))
                   : ListView.separated(
                       itemCount: _alwaysWrong.length,
                       separatorBuilder: (_, __) => const Divider(height: 1),
@@ -149,8 +155,14 @@ class _QaPairsPageState extends State<QaPairsPage> {
                         return ListTile(
                           leading: Icon(item.blacklisted ? Icons.block : Icons.quiz),
                           title: Text(item.question, maxLines: 2, overflow: TextOverflow.ellipsis),
-                          subtitle: Text('QA ${item.qaId} - ${item.videoId} - attempts: ${item.attempts}', maxLines: 1, overflow: TextOverflow.ellipsis),
-                          trailing: item.blacklisted ? const Text('blacklisted') : null,
+                          subtitle: Text('QA ${item.qaId} - ${item.videoId} - attempts: ${item.attempts} - ${item.qaFile}', maxLines: 1, overflow: TextOverflow.ellipsis),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (item.blacklisted) const Padding(padding: EdgeInsets.only(right: 8), child: Text('blacklisted')),
+                              IconButton(onPressed: _refreshing ? null : () => _deleteListItem(index), icon: const Icon(Icons.delete), tooltip: 'Delete QA pair'),
+                            ],
+                          ),
                           onTap: () => _openEditor(index),
                         );
                       },
@@ -220,6 +232,73 @@ class _QaPairsPageState extends State<QaPairsPage> {
       return;
     }
     setState(() => _alwaysWrong = updated.items);
+  }
+
+  Future<void> _deleteListItem(int index) async {
+    final item = _alwaysWrong[index];
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete QA pair?'),
+        content: Text('Are you sure you want to delete QA ${item.qaId} from ${item.qaFile}? This removes it from the JSON file.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
+          FilledButton.tonalIcon(onPressed: () => Navigator.of(context).pop(true), icon: const Icon(Icons.delete), label: const Text('Delete')),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
+    setState(() {
+      _refreshing = true;
+      _error = null;
+    });
+    try {
+      await _qaPairsClient.deleteQaPair(qaFile: item.qaFile, qaId: item.qaId, qaPair: item.qaPair);
+      setState(() => _alwaysWrong = List<AlwaysWrongQaPair>.from(_alwaysWrong)..removeAt(index));
+    } catch (error) {
+      setState(() => _error = 'Could not delete QA pair: $error');
+    } finally {
+      if (mounted) {
+        setState(() => _refreshing = false);
+      }
+    }
+  }
+
+  Future<void> _deleteAllItems() async {
+    final items = List<AlwaysWrongQaPair>.from(_alwaysWrong);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete all QA pairs?'),
+        content: Text('Are you sure you want to delete all ${items.length} QA pairs without correct answers? This removes them from their JSON files.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
+          FilledButton.tonalIcon(onPressed: () => Navigator.of(context).pop(true), icon: const Icon(Icons.delete_sweep), label: const Text('Delete all')),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
+    setState(() {
+      _refreshing = true;
+      _error = null;
+    });
+    try {
+      for (final item in items) {
+        await _qaPairsClient.deleteQaPair(qaFile: item.qaFile, qaId: item.qaId, qaPair: item.qaPair);
+      }
+      setState(() => _alwaysWrong = const []);
+    } catch (error) {
+      setState(() => _error = 'Could not delete all QA pairs: $error');
+      await _refreshAlwaysWrong();
+    } finally {
+      if (mounted) {
+        setState(() => _refreshing = false);
+      }
+    }
   }
 }
 
@@ -353,7 +432,7 @@ class _QaPairEditorDialogState extends State<_QaPairEditorDialog> {
     });
     try {
       final parsed = _parsedJson();
-      await widget.client.updateQaPair(qaFile: _item.qaFile, qaId: _item.qaId, qaPair: parsed);
+      await widget.client.updateQaPair(qaFile: _item.qaFile, qaId: _item.qaId, qaPair: parsed, oldQaPair: _item.qaPair);
       setState(() => _items[_index] = _item.copyWith(qaPair: parsed));
     } catch (error) {
       setState(() => _error = 'Could not save QA pair: $error');
@@ -365,12 +444,27 @@ class _QaPairEditorDialogState extends State<_QaPairEditorDialog> {
   }
 
   Future<void> _deleteCurrent() async {
+    final item = _item;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete QA pair?'),
+        content: Text('Are you sure you want to delete QA ${item.qaId} from ${item.qaFile}? This removes it from the JSON file.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
+          FilledButton.tonalIcon(onPressed: () => Navigator.of(context).pop(true), icon: const Icon(Icons.delete), label: const Text('Delete')),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
     setState(() {
       _saving = true;
       _error = null;
     });
     try {
-      await widget.client.deleteQaPair(qaFile: _item.qaFile, qaId: _item.qaId);
+      await widget.client.deleteQaPair(qaFile: item.qaFile, qaId: item.qaId, qaPair: item.qaPair);
       var shouldClose = false;
       setState(() {
         _items.removeAt(_index);

@@ -150,6 +150,11 @@ class BenchmarksClient {
     return BenchmarkRun.fromJson(jsonDecode(response.responseText ?? '{}') as Map<String, dynamic>);
   }
 
+  Future<BenchmarkRun> pauseRun(String runId) async {
+    final response = await html.HttpRequest.request('/api/benchmarks/runs/$runId/pause/', method: 'POST');
+    return BenchmarkRun.fromJson(jsonDecode(response.responseText ?? '{}') as Map<String, dynamic>);
+  }
+
   Future<void> deleteRun(String runId) async {
     await html.HttpRequest.request('/api/benchmarks/runs/$runId/delete/', method: 'DELETE');
   }

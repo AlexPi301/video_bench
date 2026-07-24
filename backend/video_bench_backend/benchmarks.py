@@ -314,7 +314,7 @@ def update_benchmark_run(request: HttpRequest, run_id: str) -> JsonResponse:
 @require_http_methods(["DELETE", "POST"])
 def delete_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
     run = _load_run(run_id)
-    if str(run.get("status")) == "running" or run_id in _RUNNING:
+    if str(run.get("status")) in {"queued", "running", "pausing"} or run_id in _RUNNING:
         return JsonResponse({"error": "Cannot delete a running benchmark run."}, status=409)
     directory = _run_dir(run_id)
     if directory.exists():
@@ -348,14 +348,27 @@ def resume_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
     run = _load_run(run_id)
     if run_id in _RUNNING or str(run.get("status")) in {"queued", "running"}:
         return JsonResponse({"error": "Benchmark run is already running."}, status=409)
-    if str(run.get("status")) != "failed":
-        return JsonResponse({"error": "Only failed benchmark runs can be resumed."}, status=409)
+    if str(run.get("status")) not in {"failed", "paused"}:
+        return JsonResponse({"error": "Only failed or paused benchmark runs can be resumed."}, status=409)
     event = threading.Event()
     _RUNNING[run_id] = event
     _update_run(run_id, status="queued", error="")
     _append_event(run_id, "queued", "Benchmark run queued for resume.")
     thread = threading.Thread(target=_run_benchmark_worker, args=(run_id, event, True), daemon=True)
     thread.start()
+    return JsonResponse(_run_response(_load_run(run_id)))
+
+
+@csrf_exempt
+@require_POST
+def pause_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
+    run = _load_run(run_id)
+    cancel_event = _RUNNING.get(run_id)
+    if cancel_event is None or str(run.get("status")) not in {"queued", "running"}:
+        return JsonResponse({"error": "Only active benchmark runs can be paused."}, status=409)
+    _update_run(run_id, status="pausing")
+    _append_event(run_id, "pause_requested", "Benchmark pause requested; stopping after the current QA pair finishes.")
+    cancel_event.set()
     return JsonResponse(_run_response(_load_run(run_id)))
 
 
@@ -383,11 +396,11 @@ def get_benchmark_run_events(request: HttpRequest, run_id: str) -> JsonResponse:
 def _run_response(run: dict[str, Any]) -> dict[str, Any]:
     out = dict(run)
     out.pop("run_dir", None)
-    blacklisted_ids = _blacklisted_qa_ids_for_run(run)
-    out["metrics"] = _calculate_metrics(_results_path(str(run.get("id") or "")), blacklisted_ids=blacklisted_ids)
-    out["metricsIncludingBlacklisted"] = _calculate_metrics(_results_path(str(run.get("id") or "")), blacklisted_ids=set())
-    processed_count = _result_count_excluding(_results_path(str(run.get("id") or "")), blacklisted_ids)
-    out["details"] = {"processedQaPairs": processed_count, "skippedBlacklistedQaPairs": len(blacklisted_ids)}
+    blacklisted_keys = _blacklisted_qa_keys_for_run(run)
+    out["metrics"] = _calculate_metrics(_results_path(str(run.get("id") or "")), blacklisted_keys=blacklisted_keys)
+    out["metricsIncludingBlacklisted"] = _calculate_metrics(_results_path(str(run.get("id") or "")), blacklisted_keys=set())
+    processed_count = _result_count_excluding(_results_path(str(run.get("id") or "")), blacklisted_keys)
+    out["details"] = {"processedQaPairs": processed_count, "skippedBlacklistedQaPairs": len(blacklisted_keys)}
     out["canStart"] = _can_start(run)
     out["canResume"] = _can_resume(run)
     out["resultsUrl"] = f"/api/benchmarks/runs/{run.get('id')}/results/"
@@ -416,36 +429,48 @@ def get_always_wrong_qa_pairs(request: HttpRequest) -> JsonResponse:
     runs = [run for run in _all_runs() if not selected_ids or str(run.get("id") or "") in selected_ids]
     stats: dict[str, dict[str, Any]] = {}
     qa_lookup: dict[str, dict[str, Any]] = {}
+    legacy_key_map: dict[str, str] = {}
+    qa_id_map: dict[str, set[str]] = {}
+    for qa_file in _discover_qa_pair_files():
+        for pair in _load_qa_pairs_from_file(qa_file):
+            item = dict(pair)
+            item["_qa_file"] = qa_file
+            qa_key = _qa_pair_key(item)
+            qa_id = str(item.get("id") or item.get("qa_id") or "")
+            if not qa_key:
+                continue
+            qa_lookup.setdefault(qa_key, {"qaFile": qa_file, "qaPair": pair})
+            stats.setdefault(qa_key, {"attempts": 0, "correct": 0, "runs": set()})
+            legacy_key_map.setdefault(_qa_pair_file_key(item), qa_key)
+            if qa_id:
+                qa_id_map.setdefault(qa_id, set()).add(qa_key)
+    unique_qa_id_map = {qa_id: next(iter(keys)) for qa_id, keys in qa_id_map.items() if len(keys) == 1}
     for run in runs:
-        for qa_file in list(run.get("qa_files") or []):
-            for pair in _load_qa_pairs_from_file(str(qa_file)):
-                qa_id = str(pair.get("id") or pair.get("qa_id") or "")
-                if qa_id:
-                    qa_lookup.setdefault(qa_id, {"qaFile": qa_file, "qaPair": pair})
         results_path = _results_path(str(run.get("id") or ""))
         if not results_path.is_file():
             continue
         with results_path.open("r", encoding="utf-8", newline="") as handle:
             for row in csv.DictReader(handle):
-                qa_id = str(row.get("qa_id") or "")
-                if not qa_id:
+                qa_key = _result_row_key(row, legacy_key_map=legacy_key_map, unique_qa_id_map=unique_qa_id_map)
+                if not qa_key or qa_key not in stats:
                     continue
-                stat = stats.setdefault(qa_id, {"attempts": 0, "correct": 0, "runs": set()})
+                stat = stats[qa_key]
                 stat["attempts"] += 1
                 stat["runs"].add(str(run.get("id") or ""))
                 if str(row.get("is_correct") or "").lower() == "true":
                     stat["correct"] += 1
     blacklist = _load_blacklist_entries()
     items = []
-    for qa_id, stat in sorted(stats.items(), key=lambda entry: str(entry[0])):
-        if int(stat.get("attempts") or 0) <= 0 or int(stat.get("correct") or 0) > 0:
+    for qa_key, stat in sorted(stats.items(), key=lambda entry: str(entry[0])):
+        if int(stat.get("correct") or 0) > 0:
             continue
-        qa_info = qa_lookup.get(qa_id)
+        qa_info = qa_lookup.get(qa_key)
         if not qa_info:
             continue
         qa_file = str(qa_info.get("qaFile") or "")
         pair = dict(qa_info.get("qaPair") or {})
         items.append({
+            "qaKey": qa_key,
             "qaFile": qa_file,
             "qaPair": pair,
             "attempts": int(stat.get("attempts") or 0),
@@ -476,8 +501,9 @@ def set_qa_pair_blacklist(request: HttpRequest) -> JsonResponse:
     if blacklisted:
         entries.append({
             "qa_file": qa_file,
+            "qa_key": key[1],
             "qa_id": str(qa_pair.get("id") or qa_pair.get("qa_id") or ""),
-            "video_id": str(qa_pair.get("video_id") or ""),
+            "video_id": _normalized_qa_video_id(qa_pair),
             "question": str(qa_pair.get("question") or ""),
             "blacklisted_at": _now_iso(),
         })
@@ -495,13 +521,17 @@ def update_qa_pair(request: HttpRequest) -> JsonResponse:
     qa_file = str(payload.get("qaFile") or "").strip()
     qa_pair = dict(payload.get("qaPair") or {})
     qa_id = str(payload.get("qaId") or qa_pair.get("id") or qa_pair.get("qa_id") or "").strip()
+    old_pair = dict(payload.get("oldQaPair") or {})
+    match_key = _qa_pair_key({**old_pair, "_qa_file": qa_file}) if old_pair else ""
     if not qa_file or not qa_id:
         return JsonResponse({"error": "qaFile and qaPair.id are required."}, status=400)
     path = _safe_resolve(_mounted_root(), qa_file)
     payload_json = _load_qa_payload(path)
     pairs = _qa_pairs_list(payload_json)
     for index, pair in enumerate(pairs):
-        if str(pair.get("id") or pair.get("qa_id") or "") == qa_id:
+        item = dict(pair)
+        item["_qa_file"] = qa_file
+        if (match_key and _qa_pair_key(item) == match_key) or (not match_key and str(pair.get("id") or pair.get("qa_id") or "") == qa_id):
             pairs[index] = qa_pair
             _write_json_atomic(path, payload_json)
             return JsonResponse({"qaFile": qa_file, "qaPair": qa_pair})
@@ -517,13 +547,22 @@ def delete_qa_pair(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": f"Invalid JSON body: {exc}"}, status=400)
     qa_file = str(payload.get("qaFile") or "").strip()
     qa_id = str(payload.get("qaId") or "").strip()
+    qa_pair = dict(payload.get("qaPair") or {})
+    match_key = _qa_pair_key({**qa_pair, "_qa_file": qa_file}) if qa_pair else ""
     if not qa_file or not qa_id:
         return JsonResponse({"error": "qaFile and qaId are required."}, status=400)
     path = _safe_resolve(_mounted_root(), qa_file)
     payload_json = _load_qa_payload(path)
     pairs = _qa_pairs_list(payload_json)
     original_len = len(pairs)
-    pairs[:] = [pair for pair in pairs if str(pair.get("id") or pair.get("qa_id") or "") != qa_id]
+    pairs[:] = [
+        pair
+        for pair in pairs
+        if not (
+            (match_key and _qa_pair_key({**dict(pair), "_qa_file": qa_file}) == match_key)
+            or (not match_key and str(pair.get("id") or pair.get("qa_id") or "") == qa_id)
+        )
+    ]
     if len(pairs) == original_len:
         return JsonResponse({"error": f"QA pair {qa_id} not found."}, status=404)
     _write_json_atomic(path, payload_json)
@@ -540,15 +579,15 @@ def _can_start(run: dict[str, Any]) -> bool:
 
 def _can_resume(run: dict[str, Any]) -> bool:
     run_id = str(run.get("id") or "")
-    return run_id not in _RUNNING and str(run.get("status")) == "failed"
+    return run_id not in _RUNNING and str(run.get("status")) in {"failed", "paused"}
 
 
-def _calculate_metrics(path: Path, *, blacklisted_ids: set[str]) -> dict[str, Any]:
+def _calculate_metrics(path: Path, *, blacklisted_keys: set[str]) -> dict[str, Any]:
     if not path.is_file() or path.stat().st_size == 0:
         return {"total": {"correct": 0, "count": 0, "percent": 0.0}, "byFamily": {}, "dayNight": {}}
     rows: list[dict[str, str]] = []
     with path.open("r", encoding="utf-8", newline="") as handle:
-        rows = [row for row in csv.DictReader(handle) if str(row.get("qa_id") or "") not in blacklisted_ids]
+        rows = [row for row in csv.DictReader(handle) if _result_row_key(row) not in blacklisted_keys]
 
     def bucket_percent(bucket_rows: list[dict[str, str]]) -> dict[str, Any]:
         count = len(bucket_rows)
@@ -574,7 +613,7 @@ def _run_benchmark_worker(run_id: str, cancel_event: threading.Event, resume: bo
         run = _update_run(run_id, status="running", started_at=_now_iso(), run_date=_now_iso())
         _append_event(run_id, "started", "Benchmark execution resumed." if resume else "Benchmark execution started.")
         _execute_benchmark(run, cancel_event, resume=resume)
-        if str(_load_run(run_id).get("status")) == "cancelled":
+        if str(_load_run(run_id).get("status")) in {"cancelled", "paused"}:
             return
         completed_run = _load_run(run_id)
         progress = dict(completed_run.get("progress") or {})
@@ -597,7 +636,7 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
     batch_same_evidence_spans = bool(run.get("batch_same_evidence_spans", True))
     skip_evidence_above_threshold = bool(run.get("skip_evidence_above_threshold", True))
     evidence_duration_threshold = float(run.get("evidence_duration_threshold_seconds") or 25)
-    completed_qa_keys = _completed_qa_keys_from_results(_results_path(run_id)) if resume and batch_same_evidence_spans else set()
+    completed_qa_keys = (_completed_qa_keys_from_results(_results_path(run_id)) | _completed_qa_keys_from_events(run_id)) if resume and batch_same_evidence_spans else set()
     resume_index = _resume_index_from_events(run_id, questions) if resume and not batch_same_evidence_spans else 0
     processed_indices = {
         index
@@ -630,8 +669,8 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
                 continue
             item = questions[index]
             if cancel_event.is_set():
-                _update_run(run_id, status="cancelled")
-                _append_event(run_id, "cancelled", "Benchmark execution cancelled.")
+                _update_run(run_id, status="paused")
+                _append_event(run_id, "paused", "Benchmark execution paused.")
                 return
             qa_id = str(item.get("id") or item.get("qa_id") or "")
             qa_key = _qa_pair_key(item)
@@ -691,7 +730,7 @@ def _resume_index_from_events(run_id: str, questions: list[dict[str, Any]]) -> i
                     row = json.loads(line)
                 except Exception:
                     continue
-                if not isinstance(row, dict) or row.get("type") != "question_done":
+                if not isinstance(row, dict) or row.get("type") not in {"question_done", "question_skipped"}:
                     continue
                 completed_count += 1
                 last_completed_qa_key = str(row.get("qaKey") or "")
@@ -758,14 +797,50 @@ def _load_all_questions(qa_files: list[str]) -> list[dict[str, Any]]:
 
 
 def _qa_pair_key(item: dict[str, Any]) -> str:
-    return f"{str(item.get('_qa_file') or '')}::{str(item.get('id') or item.get('qa_id') or '')}"
+    video_id = _normalized_qa_video_id(item)
+    qa_id = str(item.get("id") or item.get("qa_id") or "").strip()
+    if not video_id or not qa_id:
+        return ""
+    return f"{video_id}::{qa_id}"
 
 
-def _result_row_key(row: dict[str, Any]) -> str:
+def _qa_pair_file_key(item: dict[str, Any]) -> str:
+    qa_file = str(item.get("_qa_file") or "").strip()
+    qa_id = str(item.get("id") or item.get("qa_id") or "").strip()
+    if not qa_file or not qa_id:
+        return ""
+    return f"{qa_file}::{qa_id}"
+
+
+def _result_row_key(row: dict[str, Any], *, legacy_key_map: dict[str, str] | None = None, unique_qa_id_map: dict[str, str] | None = None) -> str:
+    qa_id = str(row.get("qa_id") or "").strip()
+    video_id = str(row.get("video_id") or "").strip()
+    suffix = Path(video_id).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        video_id = video_id[: -len(suffix)]
+    if video_id and qa_id:
+        return f"{video_id}::{qa_id}"
     qa_key = str(row.get("qa_key") or "")
     if qa_key:
-        return qa_key
-    return str(row.get("qa_id") or "")
+        return (legacy_key_map or {}).get(qa_key, qa_key)
+    if qa_id:
+        return (unique_qa_id_map or {}).get(qa_id, "")
+    return ""
+
+
+def _discover_qa_pair_files() -> list[str]:
+    root = _mounted_root()
+    if not root.is_dir():
+        return []
+    paths: list[str] = []
+    for path in root.rglob("qa_pairs.json"):
+        if not path.is_file():
+            continue
+        try:
+            paths.append(path.resolve().relative_to(root).as_posix())
+        except Exception:
+            continue
+    return sorted(set(paths))
 
 
 def _load_qa_pairs_from_file(rel_path: str) -> list[dict[str, Any]]:
@@ -805,15 +880,17 @@ def _load_blacklist_entries() -> list[dict[str, Any]]:
     return []
 
 
-def _blacklisted_qa_ids_for_run(run: dict[str, Any]) -> set[str]:
+def _blacklisted_qa_keys_for_run(run: dict[str, Any]) -> set[str]:
     entries = _load_blacklist_entries()
     blacklisted: set[str] = set()
     for qa_file in list(run.get("qa_files") or []):
         for pair in _load_qa_pairs_from_file(str(qa_file)):
-            if _qa_pair_is_blacklisted(entries, str(qa_file), pair):
-                qa_id = str(pair.get("id") or pair.get("qa_id") or "")
-                if qa_id:
-                    blacklisted.add(qa_id)
+            item = dict(pair)
+            item["_qa_file"] = str(qa_file)
+            if _qa_pair_is_blacklisted(entries, str(qa_file), item):
+                qa_key = _qa_pair_key(item)
+                if qa_key:
+                    blacklisted.add(qa_key)
     return blacklisted
 
 
@@ -823,11 +900,20 @@ def _qa_pair_is_blacklisted(entries: list[dict[str, Any]], qa_file: str, qa_pair
 
 
 def _qa_pair_blacklist_key(qa_file: str, qa_pair: dict[str, Any]) -> tuple[str, str]:
-    return (str(qa_file or ""), str(qa_pair.get("id") or qa_pair.get("qa_id") or ""))
+    item = dict(qa_pair)
+    item["_qa_file"] = qa_file
+    return (str(qa_file or ""), _qa_pair_key(item))
 
 
 def _blacklist_entry_key(entry: dict[str, Any]) -> tuple[str, str]:
-    return (str(entry.get("qa_file") or entry.get("qaFile") or ""), str(entry.get("qa_id") or entry.get("qaId") or ""))
+    qa_file = str(entry.get("qa_file") or entry.get("qaFile") or "")
+    qa_key = str(entry.get("qa_key") or entry.get("qaKey") or "")
+    if not qa_key:
+        qa_id = str(entry.get("qa_id") or entry.get("qaId") or "")
+        video_id = str(entry.get("video_id") or entry.get("videoId") or "")
+        item = {"_qa_file": qa_file, "id": qa_id, "video_id": video_id}
+        qa_key = _qa_pair_key(item) or qa_id
+    return (qa_file, qa_key)
 
 
 def _batch_indices_for_same_evidence_span(questions: list[dict[str, Any]], processed_indices: set[int], first_index: int) -> list[int]:
@@ -920,25 +1006,7 @@ def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], me
     raw_answer = _completion_text(response)
     parsed = _parse_model_answer(raw_answer)
     correct = _score_answer(item, parsed)
-    return {
-        "qa_id": str(item.get("id") or item.get("qa_id") or ""),
-        "video_id": _normalized_qa_video_id(item),
-        "question": str(item.get("question") or ""),
-        "answer_format": str(item.get("answer_format") or ""),
-        "family": str(item.get("family") or ""),
-        "reasoning_types": ",".join(str(x) for x in list(item.get("reasoning_types") or [])),
-        "difficulty": str(item.get("difficulty") or ""),
-        "visibility": str(item.get("visibility") or ""),
-        "day_night": str(item.get("day_night") or ""),
-        "unanswerable_gt": _bool_text(bool(item.get("unanswerable", False))),
-        "ground_truth_resolved": _answer_text(item.get("answer")),
-        "model": model,
-        "raw_model_answer": raw_answer,
-        "parsed_model_answer": _answer_text(parsed.get("answer")),
-        "is_correct": _bool_text(correct),
-        "score_method": "rule_based",
-        "model_declared_unanswerable": _bool_text(bool(parsed.get("unanswerable", False))),
-    }
+    return _benchmark_result_row(item, model, raw_answer, parsed, correct)
 
 
 def _complete_answers_batch(litellm: Any, run: dict[str, Any], items: list[dict[str, Any]], messages: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -1009,8 +1077,9 @@ def _resolve_video_path(item: dict[str, Any]) -> Path:
 
 def _normalized_qa_video_id(item: dict[str, Any]) -> str:
     video_id = str(item.get("video_id") or "").strip()
-    if video_id.lower().endswith(".mov"):
-        return video_id[:-4]
+    suffix = Path(video_id).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        return video_id[: -len(suffix)]
     return video_id
 
 
@@ -1211,18 +1280,42 @@ def _result_count(path: Path) -> int:
         return max(0, sum(1 for _ in handle) - 1)
 
 
-def _result_count_excluding(path: Path, excluded_qa_ids: set[str]) -> int:
+def _result_count_excluding(path: Path, excluded_qa_keys: set[str]) -> int:
     if not path.is_file() or path.stat().st_size == 0:
         return 0
     with path.open("r", encoding="utf-8", newline="") as handle:
-        return sum(1 for row in csv.DictReader(handle) if str(row.get("qa_id") or "") not in excluded_qa_ids)
+        return sum(1 for row in csv.DictReader(handle) if _result_row_key(row) not in excluded_qa_keys)
 
 
 def _completed_qa_keys_from_results(path: Path) -> set[str]:
     if not path.is_file() or path.stat().st_size == 0:
         return set()
     with path.open("r", encoding="utf-8", newline="") as handle:
-        return {_result_row_key(row) for row in csv.DictReader(handle) if _result_row_key(row)}
+        keys: set[str] = set()
+        for row in csv.DictReader(handle):
+            key = _result_row_key(row)
+            if key:
+                keys.add(key)
+        return keys
+
+
+def _completed_qa_keys_from_events(run_id: str) -> set[str]:
+    path = _events_path(run_id)
+    if not path.is_file():
+        return set()
+    keys: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict) or row.get("type") not in {"question_done", "question_skipped"}:
+                continue
+            qa_key = str(row.get("qaKey") or "")
+            if qa_key:
+                keys.add(qa_key)
+    return keys
 
 
 def _import_required(module_name: str, message: str) -> Any:

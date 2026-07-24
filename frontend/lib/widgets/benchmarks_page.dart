@@ -145,9 +145,11 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
               children: [
                 Expanded(child: Text(run.name, style: Theme.of(context).textTheme.titleLarge)),
                 FilledButton.icon(
-                  onPressed: run.canResume ? () => _resumeRun(run) : (run.canStart ? () => _startRun(run) : null),
-                  icon: Icon(run.canResume ? Icons.replay : Icons.play_arrow),
-                  label: Text(run.canResume ? 'Resume' : 'Start'),
+                  onPressed: run.canPause
+                      ? () => _pauseRun(run)
+                      : (run.canResume ? () => _resumeRun(run) : (run.canStart ? () => _startRun(run) : null)),
+                  icon: Icon(run.canPause ? Icons.pause : (run.canResume ? Icons.replay : Icons.play_arrow)),
+                  label: Text(run.canPause ? 'Pause' : (run.canResume ? 'Resume' : 'Start')),
                 ),
                 const SizedBox(width: 8),
                 IconButton(onPressed: run.isRunning ? null : () => _openEditDialog(run), icon: const Icon(Icons.edit), tooltip: 'Edit'),
@@ -344,6 +346,18 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
     } catch (error) {
       if (mounted) {
         setState(() => _error = 'Could not resume benchmark run: $error');
+      }
+    }
+  }
+
+  Future<void> _pauseRun(BenchmarkRun run) async {
+    try {
+      final updated = await _client.pauseRun(run.id);
+      setState(() => _selected = updated);
+      await _refresh();
+    } catch (error) {
+      if (mounted) {
+        setState(() => _error = 'Could not pause benchmark run: $error');
       }
     }
   }

@@ -3,6 +3,7 @@ import 'dart:html' as html;
 
 class AlwaysWrongQaPair {
   const AlwaysWrongQaPair({
+    required this.qaKey,
     required this.qaFile,
     required this.qaPair,
     required this.attempts,
@@ -10,6 +11,7 @@ class AlwaysWrongQaPair {
     required this.blacklisted,
   });
 
+  final String qaKey;
   final String qaFile;
   final Map<String, dynamic> qaPair;
   final int attempts;
@@ -23,6 +25,7 @@ class AlwaysWrongQaPair {
   AlwaysWrongQaPair copyWith({Map<String, dynamic>? qaPair, bool? blacklisted}) {
     return AlwaysWrongQaPair(
       qaFile: qaFile,
+      qaKey: qaKey,
       qaPair: qaPair ?? this.qaPair,
       attempts: attempts,
       runIds: runIds,
@@ -35,6 +38,7 @@ class AlwaysWrongQaPair {
     final rawRuns = json['runIds'];
     return AlwaysWrongQaPair(
       qaFile: json['qaFile']?.toString() ?? '',
+      qaKey: json['qaKey']?.toString() ?? '',
       qaPair: Map<String, dynamic>.from((rawPair as Map?) ?? const {}),
       attempts: _int(json['attempts']),
       runIds: rawRuns is List ? rawRuns.map((item) => item.toString()).toList(growable: false) : const [],
@@ -60,21 +64,21 @@ class QaPairsClient {
         : const [];
   }
 
-  Future<void> updateQaPair({required String qaFile, required String qaId, required Map<String, dynamic> qaPair}) async {
+  Future<void> updateQaPair({required String qaFile, required String qaId, required Map<String, dynamic> qaPair, required Map<String, dynamic> oldQaPair}) async {
     await html.HttpRequest.request(
       '/api/qa-pairs/update/',
       method: 'POST',
       requestHeaders: {'Content-Type': 'application/json'},
-      sendData: jsonEncode({'qaFile': qaFile, 'qaId': qaId, 'qaPair': qaPair}),
+      sendData: jsonEncode({'qaFile': qaFile, 'qaId': qaId, 'qaPair': qaPair, 'oldQaPair': oldQaPair}),
     );
   }
 
-  Future<void> deleteQaPair({required String qaFile, required String qaId}) async {
+  Future<void> deleteQaPair({required String qaFile, required String qaId, required Map<String, dynamic> qaPair}) async {
     await html.HttpRequest.request(
       '/api/qa-pairs/delete/',
       method: 'POST',
       requestHeaders: {'Content-Type': 'application/json'},
-      sendData: jsonEncode({'qaFile': qaFile, 'qaId': qaId}),
+      sendData: jsonEncode({'qaFile': qaFile, 'qaId': qaId, 'qaPair': qaPair}),
     );
   }
 
