@@ -23,6 +23,7 @@ from django.views.decorators.http import require_GET, require_POST, require_http
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 RESULT_FIELDS = [
+    "qa_key",
     "qa_id",
     "video_id",
     "question",
@@ -242,6 +243,8 @@ def create_benchmark_run(request: HttpRequest) -> JsonResponse:
         "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
         "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
         "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
+        "skip_evidence_above_threshold": _bool_payload(payload, "skipEvidenceAboveThreshold", True),
+        "evidence_duration_threshold_seconds": max(0.0, float(payload.get("evidenceDurationThresholdSeconds") or 25)),
         "output_folder": output_folder,
         "qa_files": qa_files,
         "status": "created",
@@ -295,6 +298,8 @@ def update_benchmark_run(request: HttpRequest, run_id: str) -> JsonResponse:
             "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
             "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
             "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
+            "skip_evidence_above_threshold": _bool_payload(payload, "skipEvidenceAboveThreshold", True),
+            "evidence_duration_threshold_seconds": max(0.0, float(payload.get("evidenceDurationThresholdSeconds") or 25)),
             "output_folder": output_folder,
             "qa_files": qa_files,
             "updated_at": _now_iso(),
@@ -571,7 +576,10 @@ def _run_benchmark_worker(run_id: str, cancel_event: threading.Event, resume: bo
         _execute_benchmark(run, cancel_event, resume=resume)
         if str(_load_run(run_id).get("status")) == "cancelled":
             return
-        _update_run(run_id, status="completed", completed_at=_now_iso(), progress={"processedQuestions": _result_count(_results_path(run_id)), "totalQuestions": _result_count(_results_path(run_id)), "percent": 100})
+        completed_run = _load_run(run_id)
+        progress = dict(completed_run.get("progress") or {})
+        total_questions = int(progress.get("totalQuestions") or _result_count(_results_path(run_id)))
+        _update_run(run_id, status="completed", completed_at=_now_iso(), progress={"processedQuestions": total_questions, "totalQuestions": total_questions, "percent": 100})
         _append_event(run_id, "completed", "Benchmark execution completed.")
     except Exception as exc:
         _update_run(run_id, status="failed", error=str(exc))
@@ -587,13 +595,15 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
     questions = _load_all_questions(list(run.get("qa_files") or []))
     total = len(questions)
     batch_same_evidence_spans = bool(run.get("batch_same_evidence_spans", True))
-    completed_qa_ids = _completed_qa_ids_from_results(_results_path(run_id)) if resume and batch_same_evidence_spans else set()
+    skip_evidence_above_threshold = bool(run.get("skip_evidence_above_threshold", True))
+    evidence_duration_threshold = float(run.get("evidence_duration_threshold_seconds") or 25)
+    completed_qa_keys = _completed_qa_keys_from_results(_results_path(run_id)) if resume and batch_same_evidence_spans else set()
     resume_index = _resume_index_from_events(run_id, questions) if resume and not batch_same_evidence_spans else 0
     processed_indices = {
         index
         for index, item in enumerate(questions)
-        if str(item.get("id") or item.get("qa_id") or "") in completed_qa_ids
-    } if completed_qa_ids else set(range(resume_index))
+        if _qa_pair_key(item) in completed_qa_keys
+    } if completed_qa_keys else set(range(resume_index))
     processed_count = len(processed_indices)
     percent = round(processed_count * 100 / max(1, total))
     _update_run(run_id, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
@@ -604,6 +614,8 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
 
     results_path = _results_path(run_id)
     results_path.parent.mkdir(parents=True, exist_ok=True)
+    if resume:
+        _ensure_results_fields(results_path)
     if resume and not batch_same_evidence_spans:
         _trim_results_for_resume(results_path, resume_index)
     mode = "a" if resume else "w"
@@ -622,9 +634,32 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
                 _append_event(run_id, "cancelled", "Benchmark execution cancelled.")
                 return
             qa_id = str(item.get("id") or item.get("qa_id") or "")
+            qa_key = _qa_pair_key(item)
+            if skip_evidence_above_threshold and _qa_pair_exceeds_evidence_threshold(item, evidence_duration_threshold):
+                processed_indices.add(index)
+                processed_count = len(processed_indices)
+                percent = round(processed_count * 100 / max(1, total))
+                _update_run(run_id, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
+                _append_event(
+                    run_id,
+                    "question_skipped",
+                    f"Skipped QA pair {qa_id or '<unknown>'} because evidence duration exceeds {evidence_duration_threshold:g}s.",
+                    qaId=qa_id,
+                    qaKey=qa_key,
+                    qaFile=str(item.get("_qa_file") or ""),
+                    thresholdSeconds=evidence_duration_threshold,
+                    maxEvidenceDurationSeconds=_max_evidence_duration_seconds(item),
+                    percent=percent,
+                )
+                index += 1
+                continue
             try:
                 if batch_same_evidence_spans:
-                    batch_indices = _batch_indices_for_same_evidence_span(questions, processed_indices, index)
+                    batch_indices = [
+                        item_index
+                        for item_index in _batch_indices_for_same_evidence_span(questions, processed_indices, index)
+                        if not skip_evidence_above_threshold or not _qa_pair_exceeds_evidence_threshold(questions[item_index], evidence_duration_threshold)
+                    ]
                     rows = _answer_questions_batch(cv2, litellm, run, [questions[item_index] for item_index in batch_indices])
                 else:
                     batch_indices = [index]
@@ -640,11 +675,12 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
                 processed_count = len(processed_indices)
                 percent = round(processed_count * 100 / max(1, total))
                 _update_run(run_id, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
-                _append_event(run_id, "question_done", f"Answered question {processed_count}/{total}.", qaId=row["qa_id"], percent=percent)
+                _append_event(run_id, "question_done", f"Answered question {processed_count}/{total}.", qaId=row["qa_id"], qaKey=row.get("qa_key", ""), qaFile=str(questions[item_index].get("_qa_file") or ""), percent=percent)
             index += 1
 
 
 def _resume_index_from_events(run_id: str, questions: list[dict[str, Any]]) -> int:
+    last_completed_qa_key = ""
     last_completed_qa_id = ""
     completed_count = 0
     path = _events_path(run_id)
@@ -658,7 +694,12 @@ def _resume_index_from_events(run_id: str, questions: list[dict[str, Any]]) -> i
                 if not isinstance(row, dict) or row.get("type") != "question_done":
                     continue
                 completed_count += 1
+                last_completed_qa_key = str(row.get("qaKey") or "")
                 last_completed_qa_id = str(row.get("qaId") or "")
+    if last_completed_qa_key:
+        for index, item in enumerate(questions):
+            if _qa_pair_key(item) == last_completed_qa_key:
+                return min(index + 1, len(questions))
     if last_completed_qa_id:
         for index, item in enumerate(questions):
             qa_id = str(item.get("id") or item.get("qa_id") or "")
@@ -672,6 +713,21 @@ def _trim_results_for_resume(path: Path, keep_count: int) -> None:
     if path.is_file() and path.stat().st_size > 0:
         with path.open("r", encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))[: max(0, keep_count)]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in RESULT_FIELDS})
+
+
+def _ensure_results_fields(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size == 0:
+        return
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        if list(reader.fieldnames or []) == RESULT_FIELDS:
+            return
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS)
         writer.writeheader()
@@ -699,6 +755,17 @@ def _load_all_questions(qa_files: list[str]) -> list[dict[str, Any]]:
                 item["_qa_file"] = rel_path
                 items.append(item)
     return items
+
+
+def _qa_pair_key(item: dict[str, Any]) -> str:
+    return f"{str(item.get('_qa_file') or '')}::{str(item.get('id') or item.get('qa_id') or '')}"
+
+
+def _result_row_key(row: dict[str, Any]) -> str:
+    qa_key = str(row.get("qa_key") or "")
+    if qa_key:
+        return qa_key
+    return str(row.get("qa_id") or "")
 
 
 def _load_qa_pairs_from_file(rel_path: str) -> list[dict[str, Any]]:
@@ -787,6 +854,24 @@ def _batch_evidence_key(item: dict[str, Any]) -> tuple[str, float, float] | None
     except Exception:
         return None
     return (_normalized_qa_video_id(item), start, end)
+
+
+def _qa_pair_exceeds_evidence_threshold(item: dict[str, Any], threshold_seconds: float) -> bool:
+    return _max_evidence_duration_seconds(item) > threshold_seconds
+
+
+def _max_evidence_duration_seconds(item: dict[str, Any]) -> float:
+    max_duration = 0.0
+    for span in list(item.get("evidence_spans") or []):
+        if not isinstance(span, dict):
+            continue
+        try:
+            start = float(span.get("start_seconds") or 0)
+            end = float(span.get("end_seconds") if span.get("end_seconds") is not None else start)
+        except Exception:
+            continue
+        max_duration = max(max_duration, max(0.0, end - start))
+    return max_duration
 
 
 def _answer_question(cv2: Any, litellm: Any, run: dict[str, Any], item: dict[str, Any]) -> dict[str, str]:
@@ -883,6 +968,7 @@ def _complete_answers_batch(litellm: Any, run: dict[str, Any], items: list[dict[
 
 def _benchmark_result_row(item: dict[str, Any], model: str, raw_answer: str, parsed: dict[str, Any], correct: bool) -> dict[str, str]:
     return {
+        "qa_key": _qa_pair_key(item),
         "qa_id": str(item.get("id") or item.get("qa_id") or ""),
         "video_id": _normalized_qa_video_id(item),
         "question": str(item.get("question") or ""),
@@ -1132,11 +1218,11 @@ def _result_count_excluding(path: Path, excluded_qa_ids: set[str]) -> int:
         return sum(1 for row in csv.DictReader(handle) if str(row.get("qa_id") or "") not in excluded_qa_ids)
 
 
-def _completed_qa_ids_from_results(path: Path) -> set[str]:
+def _completed_qa_keys_from_results(path: Path) -> set[str]:
     if not path.is_file() or path.stat().st_size == 0:
         return set()
     with path.open("r", encoding="utf-8", newline="") as handle:
-        return {str(row.get("qa_id") or "") for row in csv.DictReader(handle) if str(row.get("qa_id") or "")}
+        return {_result_row_key(row) for row in csv.DictReader(handle) if _result_row_key(row)}
 
 
 def _import_required(module_name: str, message: str) -> Any:

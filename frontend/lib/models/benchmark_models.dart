@@ -10,6 +10,8 @@ class BenchmarkRun {
     required this.frameSampleRate,
     required this.saveSampleFrames,
     required this.batchSameEvidenceSpans,
+    required this.skipEvidenceAboveThreshold,
+    required this.evidenceDurationThresholdSeconds,
     required this.outputFolder,
     required this.qaFiles,
     required this.status,
@@ -32,6 +34,8 @@ class BenchmarkRun {
   final int frameSampleRate;
   final bool saveSampleFrames;
   final bool batchSameEvidenceSpans;
+  final bool skipEvidenceAboveThreshold;
+  final double evidenceDurationThresholdSeconds;
   final String outputFolder;
   final List<String> qaFiles;
   final String status;
@@ -57,6 +61,8 @@ class BenchmarkRun {
       frameSampleRate: _int(json['frame_sample_rate'] ?? json['frameSampleRate']),
       saveSampleFrames: json['save_sample_frames'] == true || json['saveSampleFrames'] == true,
       batchSameEvidenceSpans: json['batch_same_evidence_spans'] != false && json['batchSameEvidenceSpans'] != false,
+      skipEvidenceAboveThreshold: json['skip_evidence_above_threshold'] != false && json['skipEvidenceAboveThreshold'] != false,
+      evidenceDurationThresholdSeconds: _double(json['evidence_duration_threshold_seconds'] ?? json['evidenceDurationThresholdSeconds'] ?? 25),
       outputFolder: json['output_folder']?.toString() ?? json['outputFolder']?.toString() ?? '',
       qaFiles: _stringList(json['qa_files'] ?? json['qaFiles']),
       status: json['status']?.toString() ?? 'unknown',

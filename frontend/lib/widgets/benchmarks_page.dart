@@ -167,6 +167,10 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
                 _InfoChip(label: 'Frame sample rate', value: '${run.frameSampleRate}'),
                 _InfoChip(label: 'Save sample frames', value: run.saveSampleFrames ? 'yes' : 'no'),
                 _InfoChip(label: 'Batch same evidence spans', value: run.batchSameEvidenceSpans ? 'yes' : 'no'),
+                _InfoChip(
+                  label: 'Evidence threshold',
+                  value: run.skipEvidenceAboveThreshold ? '${run.evidenceDurationThresholdSeconds}s' : 'off',
+                ),
                 _InfoChip(label: 'QA files', value: '${run.qaFiles.length}'),
                 _InfoChip(label: 'Output', value: '${run.outputFolder}/${run.id}'),
               ],
@@ -393,10 +397,12 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
   late final TextEditingController _lmStudioUrlController;
   late final TextEditingController _modelController;
   late final TextEditingController _frameSampleRateController;
+  late final TextEditingController _evidenceDurationThresholdController;
   late final TextEditingController _outputFolderController;
   List<String> _qaFiles = const [];
   var _saveSampleFrames = false;
   var _batchSameEvidenceSpans = true;
+  var _skipEvidenceAboveThreshold = true;
 
   @override
   void initState() {
@@ -410,10 +416,12 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
     _lmStudioUrlController = TextEditingController(text: run?.lmStudioUrl ?? 'http://host.docker.internal:1234/v1');
     _modelController = TextEditingController(text: run?.model ?? 'google/gemma-4-31b');
     _frameSampleRateController = TextEditingController(text: run == null ? '15' : '${run.frameSampleRate}');
+    _evidenceDurationThresholdController = TextEditingController(text: run == null ? '25' : '${run.evidenceDurationThresholdSeconds}');
     _outputFolderController = TextEditingController(text: run?.outputFolder ?? 'benchmark_runs');
     _qaFiles = run?.qaFiles ?? const [];
     _saveSampleFrames = run?.saveSampleFrames ?? false;
     _batchSameEvidenceSpans = run?.batchSameEvidenceSpans ?? true;
+    _skipEvidenceAboveThreshold = run?.skipEvidenceAboveThreshold ?? true;
   }
 
   @override
@@ -425,6 +433,7 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
     _lmStudioUrlController.dispose();
     _modelController.dispose();
     _frameSampleRateController.dispose();
+    _evidenceDurationThresholdController.dispose();
     _outputFolderController.dispose();
     super.dispose();
   }
@@ -489,6 +498,21 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
                         value: _batchSameEvidenceSpans,
                         onChanged: (value) => setState(() => _batchSameEvidenceSpans = value),
                       ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('skip QA pairs with evidence span above threshold'),
+                        subtitle: const Text('Ignore QA pairs whose evidence duration exceeds the configured threshold.'),
+                        value: _skipEvidenceAboveThreshold,
+                        onChanged: (value) => setState(() => _skipEvidenceAboveThreshold = value),
+                      ),
+                      if (_skipEvidenceAboveThreshold) ...[
+                        const SizedBox(height: 12),
+                        _field(
+                          _evidenceDurationThresholdController,
+                          'Maximum evidence duration in seconds',
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                        ),
+                      ],
                       const SizedBox(height: 12),
                       _field(_outputFolderController, 'output folder', readOnly: true),
                       const SizedBox(height: 12),
@@ -545,8 +569,13 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
 
   void _submit() {
     final frameSampleRate = int.tryParse(_frameSampleRateController.text.trim());
-    if (_nameController.text.trim().isEmpty || frameSampleRate == null || frameSampleRate < 1 || _qaFiles.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Name, positive frame sample rate, and QA files are required.')));
+    final evidenceDurationThreshold = double.tryParse(_evidenceDurationThresholdController.text.trim());
+    if (_nameController.text.trim().isEmpty ||
+        frameSampleRate == null ||
+        frameSampleRate < 1 ||
+        _qaFiles.isEmpty ||
+        (_skipEvidenceAboveThreshold && (evidenceDurationThreshold == null || evidenceDurationThreshold <= 0))) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Name, positive numeric values, and QA files are required.')));
       return;
     }
     if (widget.initialRun != null) {
@@ -559,6 +588,8 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
         frameSampleRate: frameSampleRate,
         saveSampleFrames: _saveSampleFrames,
         batchSameEvidenceSpans: _batchSameEvidenceSpans,
+        skipEvidenceAboveThreshold: _skipEvidenceAboveThreshold,
+        evidenceDurationThresholdSeconds: evidenceDurationThreshold ?? 25,
         outputFolder: _outputFolderController.text.trim().isEmpty ? 'benchmark_runs' : _outputFolderController.text.trim(),
         qaFiles: _qaFiles,
       ));
@@ -574,6 +605,8 @@ class _CreateBenchmarkDialogState extends State<_CreateBenchmarkDialog> {
       frameSampleRate: frameSampleRate,
       saveSampleFrames: _saveSampleFrames,
       batchSameEvidenceSpans: _batchSameEvidenceSpans,
+      skipEvidenceAboveThreshold: _skipEvidenceAboveThreshold,
+      evidenceDurationThresholdSeconds: evidenceDurationThreshold ?? 25,
       outputFolder: _outputFolderController.text.trim().isEmpty ? 'benchmark_runs' : _outputFolderController.text.trim(),
       qaFiles: _qaFiles,
     ));

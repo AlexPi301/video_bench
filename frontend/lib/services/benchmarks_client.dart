@@ -14,6 +14,8 @@ class BenchmarkCreateRequest {
     required this.frameSampleRate,
     required this.saveSampleFrames,
     required this.batchSameEvidenceSpans,
+    required this.skipEvidenceAboveThreshold,
+    required this.evidenceDurationThresholdSeconds,
     required this.outputFolder,
     required this.qaFiles,
   });
@@ -27,6 +29,8 @@ class BenchmarkCreateRequest {
   final int frameSampleRate;
   final bool saveSampleFrames;
   final bool batchSameEvidenceSpans;
+  final bool skipEvidenceAboveThreshold;
+  final double evidenceDurationThresholdSeconds;
   final String outputFolder;
   final List<String> qaFiles;
 
@@ -40,6 +44,8 @@ class BenchmarkCreateRequest {
         'frameSampleRate': frameSampleRate,
         'saveSampleFrames': saveSampleFrames,
         'batchSameEvidenceSpans': batchSameEvidenceSpans,
+        'skipEvidenceAboveThreshold': skipEvidenceAboveThreshold,
+        'evidenceDurationThresholdSeconds': evidenceDurationThresholdSeconds,
         'outputFolder': outputFolder,
         'qaFiles': qaFiles,
       };
@@ -55,6 +61,8 @@ class BenchmarkUpdateRequest {
     required this.frameSampleRate,
     required this.saveSampleFrames,
     required this.batchSameEvidenceSpans,
+    required this.skipEvidenceAboveThreshold,
+    required this.evidenceDurationThresholdSeconds,
     required this.outputFolder,
     required this.qaFiles,
   });
@@ -67,6 +75,8 @@ class BenchmarkUpdateRequest {
   final int frameSampleRate;
   final bool saveSampleFrames;
   final bool batchSameEvidenceSpans;
+  final bool skipEvidenceAboveThreshold;
+  final double evidenceDurationThresholdSeconds;
   final String outputFolder;
   final List<String> qaFiles;
 
@@ -79,6 +89,8 @@ class BenchmarkUpdateRequest {
         'frameSampleRate': frameSampleRate,
         'saveSampleFrames': saveSampleFrames,
         'batchSameEvidenceSpans': batchSameEvidenceSpans,
+        'skipEvidenceAboveThreshold': skipEvidenceAboveThreshold,
+        'evidenceDurationThresholdSeconds': evidenceDurationThresholdSeconds,
         'outputFolder': outputFolder,
         'qaFiles': qaFiles,
       };
