@@ -109,12 +109,12 @@ class _QaPairsPageState extends State<QaPairsPage> {
               itemCount: _runs.length,
               itemBuilder: (context, index) {
                 final run = _runs[index];
-                final selected = _selectedRunIds.contains(run.id);
+                final selected = _selectedRunIds.contains(run.selectionKey);
                 return CheckboxListTile(
                   value: selected,
-                  onChanged: (_) => _toggleRun(run.id),
-                  title: Text(run.name.isEmpty ? run.id : run.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-                  subtitle: Text('${run.status} - ${run.id}', maxLines: 1, overflow: TextOverflow.ellipsis),
+                  onChanged: (_) => _toggleRun(run.selectionKey),
+                  title: Text(run.model.isEmpty ? run.id : run.model, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  subtitle: Text('${run.status} - ${run.selectionKey}', maxLines: 1, overflow: TextOverflow.ellipsis),
                 );
               },
             ),
@@ -176,10 +176,11 @@ class _QaPairsPageState extends State<QaPairsPage> {
 
   Future<void> _loadRuns() async {
     try {
-      final runs = await _benchmarksClient.listRuns();
+      final benchmarks = await _benchmarksClient.listBenchmarks();
+      final runs = [for (final benchmark in benchmarks) ...benchmark.runs];
       setState(() {
         _runs = runs;
-        _selectedRunIds = runs.map((run) => run.id).toSet();
+        _selectedRunIds = runs.map((run) => run.selectionKey).toSet();
         _loading = false;
         _error = null;
       });
@@ -192,7 +193,7 @@ class _QaPairsPageState extends State<QaPairsPage> {
   }
 
   void _selectAllRuns() {
-    setState(() => _selectedRunIds = _runs.map((run) => run.id).toSet());
+    setState(() => _selectedRunIds = _runs.map((run) => run.selectionKey).toSet());
   }
 
   void _toggleRun(String runId) {

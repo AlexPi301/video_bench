@@ -6,19 +6,25 @@ The backend is intentionally integrated without application-specific endpoints y
 from django.urls import path
 
 from .benchmarks import (
+    add_benchmark_run,
+    create_benchmark,
     create_benchmark_run,
+    delete_benchmark,
     delete_qa_pair,
     delete_benchmark_run,
     get_always_wrong_qa_pairs,
+    get_benchmark,
     get_benchmark_results,
     get_benchmark_run,
     get_benchmark_run_events,
     get_qa_pair_blacklist,
+    list_benchmarks,
     list_benchmark_runs,
     pause_benchmark_run,
     resume_benchmark_run,
     set_qa_pair_blacklist,
     start_benchmark_run,
+    update_benchmark,
     update_benchmark_run,
     update_qa_pair,
 )
@@ -37,6 +43,8 @@ from .mounted_files import list_mounted_files, save_mounted_file, serve_mounted_
 
 
 urlpatterns = [
+    path("api/benchmarks/", list_benchmarks, name="benchmarks-list"),
+    path("api/benchmarks/create/", create_benchmark, name="benchmarks-create"),
     path("api/benchmarks/runs/", list_benchmark_runs, name="benchmarks-run-list"),
     path("api/benchmarks/runs/create/", create_benchmark_run, name="benchmarks-run-create"),
     path("api/benchmarks/runs/<str:run_id>/", get_benchmark_run, name="benchmarks-run-detail"),
@@ -47,6 +55,17 @@ urlpatterns = [
     path("api/benchmarks/runs/<str:run_id>/resume/", resume_benchmark_run, name="benchmarks-run-resume"),
     path("api/benchmarks/runs/<str:run_id>/events/", get_benchmark_run_events, name="benchmarks-run-events"),
     path("api/benchmarks/runs/<str:run_id>/results/", get_benchmark_results, name="benchmarks-run-results"),
+    path("api/benchmarks/<str:benchmark_id>/", get_benchmark, name="benchmarks-detail"),
+    path("api/benchmarks/<str:benchmark_id>/edit/", update_benchmark, name="benchmarks-edit"),
+    path("api/benchmarks/<str:benchmark_id>/delete/", delete_benchmark, name="benchmarks-delete"),
+    path("api/benchmarks/<str:benchmark_id>/runs/create/", add_benchmark_run, name="benchmarks-run-add"),
+    path("api/benchmarks/<str:benchmark_id>/runs/<str:run_id>/", get_benchmark_run, name="benchmarks-nested-run-detail"),
+    path("api/benchmarks/<str:benchmark_id>/runs/<str:run_id>/delete/", delete_benchmark_run, name="benchmarks-nested-run-delete"),
+    path("api/benchmarks/<str:benchmark_id>/runs/<str:run_id>/start/", start_benchmark_run, name="benchmarks-nested-run-start"),
+    path("api/benchmarks/<str:benchmark_id>/runs/<str:run_id>/pause/", pause_benchmark_run, name="benchmarks-nested-run-pause"),
+    path("api/benchmarks/<str:benchmark_id>/runs/<str:run_id>/resume/", resume_benchmark_run, name="benchmarks-nested-run-resume"),
+    path("api/benchmarks/<str:benchmark_id>/runs/<str:run_id>/events/", get_benchmark_run_events, name="benchmarks-nested-run-events"),
+    path("api/benchmarks/<str:benchmark_id>/runs/<str:run_id>/results/", get_benchmark_results, name="benchmarks-nested-run-results"),
     path("api/qa-pairs/always-wrong/", get_always_wrong_qa_pairs, name="qa-pairs-always-wrong"),
     path("api/qa-pairs/blacklist/", get_qa_pair_blacklist, name="qa-pairs-blacklist"),
     path("api/qa-pairs/blacklist/set/", set_qa_pair_blacklist, name="qa-pairs-blacklist-set"),

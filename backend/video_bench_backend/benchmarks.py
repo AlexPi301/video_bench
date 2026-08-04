@@ -56,6 +56,10 @@ def _benchmark_root() -> Path:
     return _mounted_root() / "benchmark_runs"
 
 
+def _benchmarks_root() -> Path:
+    return _benchmark_root()
+
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -91,6 +95,48 @@ def _safe_run_id(run_id: str) -> str:
     return token
 
 
+def _safe_benchmark_id(benchmark_id: str) -> str:
+    return _safe_run_id(benchmark_id)
+
+
+def _run_key(benchmark_id: str, run_id: str) -> str:
+    return f"{_safe_benchmark_id(benchmark_id)}::{_safe_run_id(run_id)}"
+
+
+def _run_selection_key(run: dict[str, Any]) -> str:
+    benchmark_id = str(run.get("benchmark_id") or "")
+    run_id = str(run.get("id") or "")
+    return f"{benchmark_id}::{run_id}" if benchmark_id and run_id else run_id
+
+
+def _benchmark_dir(benchmark_id: str) -> Path:
+    return _benchmarks_root() / _safe_benchmark_id(benchmark_id)
+
+
+def _benchmark_path(benchmark_id: str) -> Path:
+    return _benchmark_dir(benchmark_id) / "benchmark.json"
+
+
+def _benchmark_runs_dir(benchmark_id: str) -> Path:
+    return _benchmark_dir(benchmark_id) / "runs"
+
+
+def _benchmark_run_dir(benchmark_id: str, run_id: str) -> Path:
+    return _benchmark_runs_dir(benchmark_id) / _safe_run_id(run_id)
+
+
+def _benchmark_run_path(benchmark_id: str, run_id: str) -> Path:
+    return _benchmark_run_dir(benchmark_id, run_id) / "run.json"
+
+
+def _benchmark_run_results_path(benchmark_id: str, run_id: str) -> Path:
+    return _benchmark_run_dir(benchmark_id, run_id) / "results.csv"
+
+
+def _benchmark_run_events_path(benchmark_id: str, run_id: str) -> Path:
+    return _benchmark_run_dir(benchmark_id, run_id) / "events.jsonl"
+
+
 def _run_dir(run_id: str) -> Path:
     return _benchmark_root() / _safe_run_id(run_id)
 
@@ -111,6 +157,22 @@ def _events_path(run_id: str) -> Path:
     return _run_dir(run_id) / "events.jsonl"
 
 
+def _run_dir_for_run(run: dict[str, Any]) -> Path:
+    benchmark_id = str(run.get("benchmark_id") or "")
+    run_id = str(run.get("id") or "")
+    if benchmark_id and not bool(run.get("legacy", False)):
+        return _benchmark_run_dir(benchmark_id, run_id)
+    return _run_dir(run_id)
+
+
+def _results_path_for_run(run: dict[str, Any]) -> Path:
+    return _run_dir_for_run(run) / "results.csv"
+
+
+def _events_path_for_run(run: dict[str, Any]) -> Path:
+    return _run_dir_for_run(run) / "events.jsonl"
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -129,6 +191,63 @@ def _load_run(run_id: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise Http404("Benchmark run is invalid.")
     return payload
+
+
+def _load_benchmark(benchmark_id: str) -> dict[str, Any]:
+    path = _benchmark_path(benchmark_id)
+    if not path.is_file():
+        raise Http404("Benchmark not found.")
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise Http404("Benchmark is invalid.")
+    return payload
+
+
+def _save_benchmark(benchmark: dict[str, Any]) -> None:
+    _write_json_atomic(_benchmark_path(str(benchmark.get("id") or "")), benchmark)
+
+
+def _load_benchmark_run(benchmark_id: str, run_id: str) -> dict[str, Any]:
+    path = _benchmark_run_path(benchmark_id, run_id)
+    if not path.is_file():
+        raise Http404("Benchmark run not found.")
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise Http404("Benchmark run is invalid.")
+    payload.setdefault("benchmark_id", benchmark_id)
+    return payload
+
+
+def _save_benchmark_run(run: dict[str, Any]) -> None:
+    _write_json_atomic(_benchmark_run_path(str(run.get("benchmark_id") or ""), str(run.get("id") or "")), run)
+
+
+def _update_benchmark(benchmark_id: str, **updates: Any) -> dict[str, Any]:
+    with _LOCK:
+        benchmark = _load_benchmark(benchmark_id)
+        benchmark.update(updates)
+        benchmark["updated_at"] = _now_iso()
+        _save_benchmark(benchmark)
+        return benchmark
+
+
+def _update_benchmark_run(benchmark_id: str, run_id: str, **updates: Any) -> dict[str, Any]:
+    with _LOCK:
+        run = _load_benchmark_run(benchmark_id, run_id)
+        run.update(updates)
+        run["updated_at"] = _now_iso()
+        _save_benchmark_run(run)
+        return run
+
+
+def _effective_run(benchmark: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(benchmark)
+    merged.update(run)
+    merged["benchmark_id"] = str(benchmark.get("id") or run.get("benchmark_id") or "")
+    merged["benchmark_name"] = str(benchmark.get("name") or "")
+    return merged
 
 
 def _save_run(run: dict[str, Any]) -> None:
@@ -153,18 +272,117 @@ def _append_event(run_id: str, event_type: str, message: str, **fields: Any) -> 
         handle.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
+def _append_run_event(benchmark_id: str, run_id: str, event_type: str, message: str, **fields: Any) -> None:
+    row = {"ts": _now_iso(), "type": event_type, "message": str(message or "")}
+    row.update(fields)
+    path = _benchmark_run_events_path(benchmark_id, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
 def _all_runs() -> list[dict[str, Any]]:
     runs: list[dict[str, Any]] = []
-    _benchmark_root().mkdir(parents=True, exist_ok=True)
-    for path in sorted(_benchmark_root().glob("*/details.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+    for benchmark in _all_benchmarks(include_legacy=True):
+        for run in list(benchmark.get("runs") or []):
+            if isinstance(run, dict):
+                runs.append(_effective_run(benchmark, run))
+    return runs
+
+
+def _all_benchmarks(*, include_legacy: bool = False) -> list[dict[str, Any]]:
+    benchmarks: list[dict[str, Any]] = []
+    root = _benchmarks_root()
+    root.mkdir(parents=True, exist_ok=True)
+    for path in sorted(root.glob("*/benchmark.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         try:
             with path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            if isinstance(payload, dict):
-                runs.append(payload)
+                benchmark = json.load(handle)
+            if isinstance(benchmark, dict):
+                benchmark["runs"] = _all_benchmark_runs(str(benchmark.get("id") or ""))
+                benchmarks.append(benchmark)
+        except Exception:
+            continue
+    if include_legacy:
+        known_ids = {str(item.get("id") or "") for item in benchmarks}
+        for path in sorted(root.glob("*/details.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    legacy_run = json.load(handle)
+                if not isinstance(legacy_run, dict):
+                    continue
+                legacy_id = str(legacy_run.get("id") or path.parent.name)
+                if legacy_id in known_ids:
+                    continue
+                benchmark = _legacy_benchmark_from_run(legacy_run, legacy_id)
+                benchmark["runs"] = [_legacy_child_run_from_run(legacy_run, legacy_id)]
+                benchmarks.append(benchmark)
+            except Exception:
+                continue
+    return benchmarks
+
+
+def _all_benchmark_runs(benchmark_id: str) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    runs_dir = _benchmark_runs_dir(benchmark_id)
+    if not runs_dir.is_dir():
+        return runs
+    for path in sorted(runs_dir.glob("*/run.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                run = json.load(handle)
+            if isinstance(run, dict):
+                run.setdefault("benchmark_id", benchmark_id)
+                runs.append(run)
         except Exception:
             continue
     return runs
+
+
+def _legacy_benchmark_from_run(run: dict[str, Any], benchmark_id: str) -> dict[str, Any]:
+    return {
+        "id": benchmark_id,
+        "name": str(run.get("name") or benchmark_id),
+        "creation_date": str(run.get("creation_date") or ""),
+        "run_date": str(run.get("run_date") or ""),
+        "description": str(run.get("description") or ""),
+        "lm_studio_url": str(run.get("lm_studio_url") or ""),
+        "frame_sample_rate": int(run.get("frame_sample_rate") or 15),
+        "save_sample_frames": bool(run.get("save_sample_frames", False)),
+        "batch_same_evidence_spans": bool(run.get("batch_same_evidence_spans", True)),
+        "skip_evidence_above_threshold": bool(run.get("skip_evidence_above_threshold", True)),
+        "evidence_duration_threshold_seconds": float(run.get("evidence_duration_threshold_seconds") or 25),
+        "output_folder": str(run.get("output_folder") or "benchmark_runs"),
+        "qa_files": list(run.get("qa_files") or []),
+        "created_at": str(run.get("created_at") or ""),
+        "updated_at": str(run.get("updated_at") or ""),
+        "legacy": True,
+    }
+
+
+def _legacy_child_run_from_run(run: dict[str, Any], benchmark_id: str) -> dict[str, Any]:
+    return {
+        "id": str(run.get("id") or benchmark_id),
+        "benchmark_id": benchmark_id,
+        "model": str(run.get("model") or ""),
+        "status": str(run.get("status") or "created"),
+        "created_at": str(run.get("created_at") or ""),
+        "updated_at": str(run.get("updated_at") or ""),
+        "started_at": str(run.get("started_at") or ""),
+        "completed_at": str(run.get("completed_at") or ""),
+        "progress": dict(run.get("progress") or {}),
+        "error": str(run.get("error") or ""),
+        "legacy": True,
+    }
+
+
+def _is_legacy_benchmark_id(benchmark_id: str) -> bool:
+    return _details_path(benchmark_id).is_file() and not _benchmark_path(benchmark_id).is_file()
+
+
+@require_GET
+def list_benchmarks(_request: HttpRequest) -> JsonResponse:
+    return JsonResponse({"benchmarks": [_benchmark_response(benchmark) for benchmark in _all_benchmarks(include_legacy=True)]})
 
 
 @require_GET
@@ -204,7 +422,7 @@ def _bool_payload(payload: dict[str, Any], key: str, default: bool = False) -> b
 
 @csrf_exempt
 @require_POST
-def create_benchmark_run(request: HttpRequest) -> JsonResponse:
+def create_benchmark(request: HttpRequest) -> JsonResponse:
     try:
         payload = _json_request(request)
     except Exception as exc:
@@ -222,24 +440,23 @@ def create_benchmark_run(request: HttpRequest) -> JsonResponse:
     output_base = _benchmark_root()
     output_base.mkdir(parents=True, exist_ok=True)
 
-    run_id = _run_stamp()
-    run_dir = output_base / run_id
+    benchmark_id = _run_stamp()
+    benchmark_dir = output_base / benchmark_id
     suffix = 1
-    while run_dir.exists():
+    while benchmark_dir.exists():
         suffix += 1
-        run_dir = output_base / f"{run_id}-{suffix}"
-    run_id = run_dir.name
-    run_dir.mkdir(parents=True, exist_ok=False)
+        benchmark_dir = output_base / f"{benchmark_id}-{suffix}"
+    benchmark_id = benchmark_dir.name
+    benchmark_dir.mkdir(parents=True, exist_ok=False)
 
     now = _now_iso()
-    run = {
-        "id": run_id,
+    benchmark = {
+        "id": benchmark_id,
         "name": name,
         "creation_date": str(payload.get("creationDate") or now),
         "run_date": str(payload.get("runDate") or ""),
         "description": str(payload.get("description") or ""),
         "lm_studio_url": str(payload.get("lmStudioUrl") or "http://host.docker.internal:1234/v1").strip(),
-        "model": str(payload.get("model") or "google/gemma-4-31b").strip(),
         "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
         "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
         "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
@@ -247,6 +464,109 @@ def create_benchmark_run(request: HttpRequest) -> JsonResponse:
         "evidence_duration_threshold_seconds": max(0.0, float(payload.get("evidenceDurationThresholdSeconds") or 25)),
         "output_folder": output_folder,
         "qa_files": qa_files,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _save_benchmark(benchmark)
+    return JsonResponse(_benchmark_response(benchmark), status=201)
+
+
+@csrf_exempt
+@require_POST
+def create_benchmark_run(request: HttpRequest) -> JsonResponse:
+    """Legacy endpoint: create a benchmark and its first run from the old flat form."""
+    benchmark_response = create_benchmark(request)
+    if benchmark_response.status_code >= 400:
+        return benchmark_response
+    benchmark = json.loads(benchmark_response.content.decode("utf-8"))
+    benchmark_id = str(benchmark.get("id") or "")
+    payload = _json_request(request)
+    run_payload = {"model": str(payload.get("model") or "google/gemma-4-31b").strip()}
+    fake_request = HttpRequest()
+    fake_request.method = "POST"
+    fake_request._body = json.dumps(run_payload).encode("utf-8")
+    return add_benchmark_run(fake_request, benchmark_id)
+
+
+@require_GET
+def get_benchmark(_request: HttpRequest, benchmark_id: str) -> JsonResponse:
+    return JsonResponse(_benchmark_response(_load_benchmark(benchmark_id)))
+
+
+@csrf_exempt
+@require_http_methods(["PATCH", "POST"])
+def update_benchmark(request: HttpRequest, benchmark_id: str) -> JsonResponse:
+    benchmark = _load_benchmark(benchmark_id)
+    if _benchmark_has_active_runs(benchmark_id):
+        return JsonResponse({"error": "Cannot edit a benchmark while one of its runs is active."}, status=409)
+    try:
+        payload = _json_request(request)
+    except Exception as exc:
+        return JsonResponse({"error": f"Invalid JSON body: {exc}"}, status=400)
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return JsonResponse({"error": "Name is required."}, status=400)
+    qa_files, error = _validated_qa_files(payload)
+    if error is not None:
+        return error
+    output_folder, error = _validated_output_folder(payload)
+    if error is not None:
+        return error
+    benchmark.update({
+        "name": name,
+        "creation_date": str(payload.get("creationDate") or benchmark.get("creation_date") or ""),
+        "run_date": str(payload.get("runDate") or benchmark.get("run_date") or ""),
+        "description": str(payload.get("description") or ""),
+        "lm_studio_url": str(payload.get("lmStudioUrl") or "http://host.docker.internal:1234/v1").strip(),
+        "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
+        "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
+        "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
+        "skip_evidence_above_threshold": _bool_payload(payload, "skipEvidenceAboveThreshold", True),
+        "evidence_duration_threshold_seconds": max(0.0, float(payload.get("evidenceDurationThresholdSeconds") or 25)),
+        "output_folder": output_folder,
+        "qa_files": qa_files,
+        "updated_at": _now_iso(),
+    })
+    _save_benchmark(benchmark)
+    return JsonResponse(_benchmark_response(benchmark))
+
+
+@csrf_exempt
+@require_http_methods(["DELETE", "POST"])
+def delete_benchmark(_request: HttpRequest, benchmark_id: str) -> JsonResponse:
+    _load_benchmark(benchmark_id)
+    if _benchmark_has_active_runs(benchmark_id):
+        return JsonResponse({"error": "Cannot delete a benchmark while one of its runs is active."}, status=409)
+    directory = _benchmark_dir(benchmark_id)
+    if directory.exists():
+        shutil.rmtree(directory)
+    return JsonResponse({"deleted": True, "id": benchmark_id})
+
+
+@csrf_exempt
+@require_POST
+def add_benchmark_run(request: HttpRequest, benchmark_id: str) -> JsonResponse:
+    _load_benchmark(benchmark_id)
+    try:
+        payload = _json_request(request)
+    except Exception as exc:
+        return JsonResponse({"error": f"Invalid JSON body: {exc}"}, status=400)
+    model = str(payload.get("model") or "google/gemma-4-31b").strip()
+    if not model:
+        return JsonResponse({"error": "Model is required."}, status=400)
+    run_id = _run_stamp()
+    run_dir = _benchmark_run_dir(benchmark_id, run_id)
+    suffix = 1
+    while run_dir.exists():
+        suffix += 1
+        run_dir = _benchmark_run_dir(benchmark_id, f"{run_id}-{suffix}")
+    run_id = run_dir.name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    now = _now_iso()
+    run = {
+        "id": run_id,
+        "benchmark_id": benchmark_id,
+        "model": model,
         "status": "created",
         "created_at": now,
         "updated_at": now,
@@ -254,16 +574,19 @@ def create_benchmark_run(request: HttpRequest) -> JsonResponse:
         "completed_at": "",
         "progress": {"processedQuestions": 0, "totalQuestions": 0, "percent": 0},
         "error": "",
-        "run_dir": str(run_dir),
-        "results_path": str(run_dir / "results.csv"),
     }
-    _save_run(run)
-    _append_event(run_id, "created", "Benchmark run created.")
-    return JsonResponse(_run_response(run), status=201)
+    _save_benchmark_run(run)
+    _append_run_event(benchmark_id, run_id, "created", "Benchmark run created.")
+    return JsonResponse(_benchmark_run_response(_load_benchmark(benchmark_id), run), status=201)
 
 
 @require_GET
-def get_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
+def get_benchmark_run(_request: HttpRequest, run_id: str, benchmark_id: str | None = None) -> JsonResponse:
+    if benchmark_id:
+        if _is_legacy_benchmark_id(benchmark_id):
+            return JsonResponse(_run_response(_load_run(run_id)))
+        benchmark = _load_benchmark(benchmark_id)
+        return JsonResponse(_benchmark_run_response(benchmark, _load_benchmark_run(benchmark_id, run_id)))
     return JsonResponse(_run_response(_load_run(run_id)))
 
 
@@ -312,7 +635,18 @@ def update_benchmark_run(request: HttpRequest, run_id: str) -> JsonResponse:
 
 @csrf_exempt
 @require_http_methods(["DELETE", "POST"])
-def delete_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
+def delete_benchmark_run(_request: HttpRequest, run_id: str, benchmark_id: str | None = None) -> JsonResponse:
+    if benchmark_id:
+        if _is_legacy_benchmark_id(benchmark_id):
+            return delete_benchmark_run(_request, run_id)
+        run = _load_benchmark_run(benchmark_id, run_id)
+        key = _run_key(benchmark_id, run_id)
+        if str(run.get("status")) in {"queued", "running", "pausing"} or key in _RUNNING:
+            return JsonResponse({"error": "Cannot delete a running benchmark run."}, status=409)
+        directory = _benchmark_run_dir(benchmark_id, run_id)
+        if directory.exists():
+            shutil.rmtree(directory)
+        return JsonResponse({"deleted": True, "benchmarkId": benchmark_id, "id": run_id})
     run = _load_run(run_id)
     if str(run.get("status")) in {"queued", "running", "pausing"} or run_id in _RUNNING:
         return JsonResponse({"error": "Cannot delete a running benchmark run."}, status=409)
@@ -324,60 +658,117 @@ def delete_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
 
 @csrf_exempt
 @require_POST
-def start_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
-    run = _load_run(run_id)
-    if run_id in _RUNNING or str(run.get("status")) in {"queued", "running"}:
+def start_benchmark_run(_request: HttpRequest, run_id: str, benchmark_id: str | None = None) -> JsonResponse:
+    if benchmark_id and _is_legacy_benchmark_id(benchmark_id):
+        return start_benchmark_run(_request, run_id)
+    if not benchmark_id:
+        run = _load_run(run_id)
+        if run_id in _RUNNING or str(run.get("status")) in {"queued", "running"}:
+            return JsonResponse({"error": "Benchmark run is already running."}, status=409)
+        if str(run.get("status")) == "failed":
+            return JsonResponse({"error": "Failed benchmark runs must be resumed, not started."}, status=409)
+        results_path = _results_path(run_id)
+        if _result_count(results_path) > 0:
+            return JsonResponse({"error": "Benchmark run already has results and cannot be started again."}, status=409)
+        event = threading.Event()
+        _RUNNING[run_id] = event
+        _update_run(run_id, status="queued", error="")
+        _append_event(run_id, "queued", "Benchmark run queued.")
+        thread = threading.Thread(target=_run_benchmark_worker, args=(run_id, event), daemon=True)
+        thread.start()
+        return JsonResponse(_run_response(_load_run(run_id)))
+    benchmark = _load_benchmark(benchmark_id)
+    run = _load_benchmark_run(benchmark_id, run_id)
+    key = _run_key(benchmark_id, run_id)
+    if key in _RUNNING or str(run.get("status")) in {"queued", "running"}:
         return JsonResponse({"error": "Benchmark run is already running."}, status=409)
     if str(run.get("status")) == "failed":
         return JsonResponse({"error": "Failed benchmark runs must be resumed, not started."}, status=409)
-    results_path = _results_path(run_id)
+    results_path = _benchmark_run_results_path(benchmark_id, run_id)
     if _result_count(results_path) > 0:
         return JsonResponse({"error": "Benchmark run already has results and cannot be started again."}, status=409)
     event = threading.Event()
-    _RUNNING[run_id] = event
-    _update_run(run_id, status="queued", error="")
-    _append_event(run_id, "queued", "Benchmark run queued.")
-    thread = threading.Thread(target=_run_benchmark_worker, args=(run_id, event), daemon=True)
+    _RUNNING[key] = event
+    _update_benchmark_run(benchmark_id, run_id, status="queued", error="")
+    _append_run_event(benchmark_id, run_id, "queued", "Benchmark run queued.")
+    thread = threading.Thread(target=_run_benchmark_worker, args=(benchmark_id, run_id, event), daemon=True)
     thread.start()
-    return JsonResponse(_run_response(_load_run(run_id)))
+    return JsonResponse(_benchmark_run_response(benchmark, _load_benchmark_run(benchmark_id, run_id)))
 
 
 @csrf_exempt
 @require_POST
-def resume_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
-    run = _load_run(run_id)
-    if run_id in _RUNNING or str(run.get("status")) in {"queued", "running"}:
+def resume_benchmark_run(_request: HttpRequest, run_id: str, benchmark_id: str | None = None) -> JsonResponse:
+    if benchmark_id and _is_legacy_benchmark_id(benchmark_id):
+        return resume_benchmark_run(_request, run_id)
+    if not benchmark_id:
+        run = _load_run(run_id)
+        if run_id in _RUNNING or str(run.get("status")) in {"queued", "running"}:
+            return JsonResponse({"error": "Benchmark run is already running."}, status=409)
+        if str(run.get("status")) not in {"failed", "paused"}:
+            return JsonResponse({"error": "Only failed or paused benchmark runs can be resumed."}, status=409)
+        event = threading.Event()
+        _RUNNING[run_id] = event
+        _update_run(run_id, status="queued", error="")
+        _append_event(run_id, "queued", "Benchmark run queued for resume.")
+        thread = threading.Thread(target=_run_benchmark_worker, args=(run_id, event, True), daemon=True)
+        thread.start()
+        return JsonResponse(_run_response(_load_run(run_id)))
+    benchmark = _load_benchmark(benchmark_id)
+    run = _load_benchmark_run(benchmark_id, run_id)
+    key = _run_key(benchmark_id, run_id)
+    if key in _RUNNING or str(run.get("status")) in {"queued", "running"}:
         return JsonResponse({"error": "Benchmark run is already running."}, status=409)
     if str(run.get("status")) not in {"failed", "paused"}:
         return JsonResponse({"error": "Only failed or paused benchmark runs can be resumed."}, status=409)
     event = threading.Event()
-    _RUNNING[run_id] = event
-    _update_run(run_id, status="queued", error="")
-    _append_event(run_id, "queued", "Benchmark run queued for resume.")
-    thread = threading.Thread(target=_run_benchmark_worker, args=(run_id, event, True), daemon=True)
+    _RUNNING[key] = event
+    _update_benchmark_run(benchmark_id, run_id, status="queued", error="")
+    _append_run_event(benchmark_id, run_id, "queued", "Benchmark run queued for resume.")
+    thread = threading.Thread(target=_run_benchmark_worker, args=(benchmark_id, run_id, event, True), daemon=True)
     thread.start()
-    return JsonResponse(_run_response(_load_run(run_id)))
+    return JsonResponse(_benchmark_run_response(benchmark, _load_benchmark_run(benchmark_id, run_id)))
 
 
 @csrf_exempt
 @require_POST
-def pause_benchmark_run(_request: HttpRequest, run_id: str) -> JsonResponse:
-    run = _load_run(run_id)
-    cancel_event = _RUNNING.get(run_id)
+def pause_benchmark_run(_request: HttpRequest, run_id: str, benchmark_id: str | None = None) -> JsonResponse:
+    if benchmark_id and _is_legacy_benchmark_id(benchmark_id):
+        return pause_benchmark_run(_request, run_id)
+    if not benchmark_id:
+        run = _load_run(run_id)
+        cancel_event = _RUNNING.get(run_id)
+        if cancel_event is None or str(run.get("status")) not in {"queued", "running"}:
+            return JsonResponse({"error": "Only active benchmark runs can be paused."}, status=409)
+        _update_run(run_id, status="pausing")
+        _append_event(run_id, "pause_requested", "Benchmark pause requested; stopping after the current QA pair finishes.")
+        cancel_event.set()
+        return JsonResponse(_run_response(_load_run(run_id)))
+    benchmark = _load_benchmark(benchmark_id)
+    run = _load_benchmark_run(benchmark_id, run_id)
+    key = _run_key(benchmark_id, run_id)
+    cancel_event = _RUNNING.get(key)
     if cancel_event is None or str(run.get("status")) not in {"queued", "running"}:
         return JsonResponse({"error": "Only active benchmark runs can be paused."}, status=409)
-    _update_run(run_id, status="pausing")
-    _append_event(run_id, "pause_requested", "Benchmark pause requested; stopping after the current QA pair finishes.")
+    _update_benchmark_run(benchmark_id, run_id, status="pausing")
+    _append_run_event(benchmark_id, run_id, "pause_requested", "Benchmark pause requested; stopping after the current QA pair finishes.")
     cancel_event.set()
-    return JsonResponse(_run_response(_load_run(run_id)))
+    return JsonResponse(_benchmark_run_response(benchmark, _load_benchmark_run(benchmark_id, run_id)))
 
 
 @require_GET
-def get_benchmark_run_events(request: HttpRequest, run_id: str) -> JsonResponse:
-    _load_run(run_id)
+def get_benchmark_run_events(request: HttpRequest, run_id: str, benchmark_id: str | None = None) -> JsonResponse:
+    if benchmark_id:
+        if _is_legacy_benchmark_id(benchmark_id):
+            _load_run(run_id)
+            benchmark_id = None
+        else:
+            _load_benchmark_run(benchmark_id, run_id)
+    else:
+        _load_run(run_id)
     after = int(request.GET.get("after", "0") or 0)
     rows: list[dict[str, Any]] = []
-    path = _events_path(run_id)
+    path = _benchmark_run_events_path(benchmark_id, run_id) if benchmark_id else _events_path(run_id)
     if path.is_file():
         with path.open("r", encoding="utf-8") as handle:
             for index, line in enumerate(handle, start=1):
@@ -393,24 +784,50 @@ def get_benchmark_run_events(request: HttpRequest, run_id: str) -> JsonResponse:
     return JsonResponse({"events": rows, "next": after + len(rows)})
 
 
-def _run_response(run: dict[str, Any]) -> dict[str, Any]:
-    out = dict(run)
+def _benchmark_response(benchmark: dict[str, Any]) -> dict[str, Any]:
+    out = dict(benchmark)
     out.pop("run_dir", None)
-    blacklisted_keys = _blacklisted_qa_keys_for_run(run)
-    out["metrics"] = _calculate_metrics(_results_path(str(run.get("id") or "")), blacklisted_keys=blacklisted_keys)
-    out["metricsIncludingBlacklisted"] = _calculate_metrics(_results_path(str(run.get("id") or "")), blacklisted_keys=set())
-    processed_count = _result_count_excluding(_results_path(str(run.get("id") or "")), blacklisted_keys)
-    out["details"] = {"processedQaPairs": processed_count, "skippedBlacklistedQaPairs": len(blacklisted_keys)}
-    out["canStart"] = _can_start(run)
-    out["canResume"] = _can_resume(run)
-    out["resultsUrl"] = f"/api/benchmarks/runs/{run.get('id')}/results/"
+    runs = _all_benchmark_runs(str(benchmark.get("id") or "")) if not bool(benchmark.get("legacy", False)) else list(benchmark.get("runs") or [])
+    out["runs"] = [_benchmark_run_response(benchmark, run) for run in runs if isinstance(run, dict)]
     return out
 
 
+def _benchmark_run_response(benchmark: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+    effective = _effective_run(benchmark, run)
+    out = dict(run)
+    out["benchmark_id"] = str(benchmark.get("id") or run.get("benchmark_id") or "")
+    blacklisted_keys = _blacklisted_qa_keys_for_run(effective)
+    results_path = _results_path_for_run(effective)
+    out["metrics"] = _calculate_metrics(results_path, blacklisted_keys=blacklisted_keys)
+    out["metricsIncludingBlacklisted"] = _calculate_metrics(results_path, blacklisted_keys=set())
+    processed_count = _result_count_excluding(results_path, blacklisted_keys)
+    out["details"] = {"processedQaPairs": processed_count, "skippedBlacklistedQaPairs": len(blacklisted_keys)}
+    out["canStart"] = _can_start(effective)
+    out["canResume"] = _can_resume(effective)
+    out["resultsUrl"] = f"/api/benchmarks/{out['benchmark_id']}/runs/{run.get('id')}/results/"
+    return out
+
+
+def _run_response(run: dict[str, Any]) -> dict[str, Any]:
+    benchmark_id = str(run.get("benchmark_id") or "")
+    if benchmark_id and not bool(run.get("legacy", False)):
+        return _benchmark_run_response(_load_benchmark(benchmark_id), run)
+    benchmark = _legacy_benchmark_from_run(run, str(run.get("id") or ""))
+    return _benchmark_run_response(benchmark, _legacy_child_run_from_run(run, str(run.get("id") or "")))
+
+
 @require_GET
-def get_benchmark_results(_request: HttpRequest, run_id: str) -> JsonResponse:
-    _load_run(run_id)
-    path = _results_path(run_id)
+def get_benchmark_results(_request: HttpRequest, run_id: str, benchmark_id: str | None = None) -> JsonResponse:
+    if benchmark_id:
+        if _is_legacy_benchmark_id(benchmark_id):
+            _load_run(run_id)
+            path = _results_path(run_id)
+        else:
+            _load_benchmark_run(benchmark_id, run_id)
+            path = _benchmark_run_results_path(benchmark_id, run_id)
+    else:
+        _load_run(run_id)
+        path = _results_path(run_id)
     rows: list[dict[str, str]] = []
     if path.is_file():
         with path.open("r", encoding="utf-8", newline="") as handle:
@@ -426,7 +843,13 @@ def get_always_wrong_qa_pairs(request: HttpRequest) -> JsonResponse:
     except Exception as exc:
         return JsonResponse({"error": f"Invalid JSON body: {exc}"}, status=400)
     selected_ids = {str(item).strip() for item in list(payload.get("runIds") or []) if str(item).strip()}
-    runs = [run for run in _all_runs() if not selected_ids or str(run.get("id") or "") in selected_ids]
+    runs = [
+        run
+        for run in _all_runs()
+        if not selected_ids
+        or str(run.get("id") or "") in selected_ids
+        or _run_selection_key(run) in selected_ids
+    ]
     stats: dict[str, dict[str, Any]] = {}
     qa_lookup: dict[str, dict[str, Any]] = {}
     legacy_key_map: dict[str, str] = {}
@@ -446,7 +869,7 @@ def get_always_wrong_qa_pairs(request: HttpRequest) -> JsonResponse:
                 qa_id_map.setdefault(qa_id, set()).add(qa_key)
     unique_qa_id_map = {qa_id: next(iter(keys)) for qa_id, keys in qa_id_map.items() if len(keys) == 1}
     for run in runs:
-        results_path = _results_path(str(run.get("id") or ""))
+        results_path = _results_path_for_run(run)
         if not results_path.is_file():
             continue
         with results_path.open("r", encoding="utf-8", newline="") as handle:
@@ -456,7 +879,7 @@ def get_always_wrong_qa_pairs(request: HttpRequest) -> JsonResponse:
                     continue
                 stat = stats[qa_key]
                 stat["attempts"] += 1
-                stat["runs"].add(str(run.get("id") or ""))
+                stat["runs"].add(_run_selection_key(run) or str(run.get("id") or ""))
                 if str(row.get("is_correct") or "").lower() == "true":
                     stat["correct"] += 1
     blacklist = _load_blacklist_entries()
@@ -571,15 +994,40 @@ def delete_qa_pair(request: HttpRequest) -> JsonResponse:
 
 def _can_start(run: dict[str, Any]) -> bool:
     run_id = str(run.get("id") or "")
-    if run_id in _RUNNING or str(run.get("status")) != "created":
+    benchmark_id = str(run.get("benchmark_id") or "")
+    key = _run_key(benchmark_id, run_id) if benchmark_id else run_id
+    if key in _RUNNING or str(run.get("status")) != "created":
         return False
-    path = _results_path(run_id)
+    path = _results_path_for_run(run)
     return not path.exists() or _result_count(path) == 0
 
 
 def _can_resume(run: dict[str, Any]) -> bool:
     run_id = str(run.get("id") or "")
-    return run_id not in _RUNNING and str(run.get("status")) in {"failed", "paused"}
+    benchmark_id = str(run.get("benchmark_id") or "")
+    key = _run_key(benchmark_id, run_id) if benchmark_id else run_id
+    return key not in _RUNNING and str(run.get("status")) in {"failed", "paused"}
+
+
+def _benchmark_has_active_runs(benchmark_id: str) -> bool:
+    return any(str(run.get("status") or "") in {"queued", "running", "pausing"} or _run_key(benchmark_id, str(run.get("id") or "")) in _RUNNING for run in _all_benchmark_runs(benchmark_id))
+
+
+def _update_execution_run(run: dict[str, Any], **updates: Any) -> dict[str, Any]:
+    benchmark_id = str(run.get("benchmark_id") or "")
+    run_id = str(run.get("id") or "")
+    if benchmark_id and not bool(run.get("legacy", False)):
+        return _update_benchmark_run(benchmark_id, run_id, **updates)
+    return _update_run(run_id, **updates)
+
+
+def _append_execution_event(run: dict[str, Any], event_type: str, message: str, **fields: Any) -> None:
+    benchmark_id = str(run.get("benchmark_id") or "")
+    run_id = str(run.get("id") or "")
+    if benchmark_id and not bool(run.get("legacy", False)):
+        _append_run_event(benchmark_id, run_id, event_type, message, **fields)
+    else:
+        _append_event(run_id, event_type, message, **fields)
 
 
 def _calculate_metrics(path: Path, *, blacklisted_keys: set[str]) -> dict[str, Any]:
@@ -608,23 +1056,52 @@ def _calculate_metrics(path: Path, *, blacklisted_keys: set[str]) -> dict[str, A
     }
 
 
-def _run_benchmark_worker(run_id: str, cancel_event: threading.Event, resume: bool = False) -> None:
+def _run_benchmark_worker(benchmark_id_or_run_id: str, run_id_or_event: str | threading.Event, cancel_event: threading.Event | None = None, resume: bool = False) -> None:
+    if isinstance(run_id_or_event, threading.Event):
+        benchmark_id = ""
+        run_id = benchmark_id_or_run_id
+        event = run_id_or_event
+        running_key = run_id
+        legacy = True
+    else:
+        benchmark_id = benchmark_id_or_run_id
+        run_id = run_id_or_event
+        event = cancel_event
+        running_key = _run_key(benchmark_id, run_id)
+        legacy = False
+    if event is None:
+        return
     try:
-        run = _update_run(run_id, status="running", started_at=_now_iso(), run_date=_now_iso())
-        _append_event(run_id, "started", "Benchmark execution resumed." if resume else "Benchmark execution started.")
-        _execute_benchmark(run, cancel_event, resume=resume)
-        if str(_load_run(run_id).get("status")) in {"cancelled", "paused"}:
+        if legacy:
+            run = _update_run(run_id, status="running", started_at=_now_iso(), run_date=_now_iso())
+            _append_event(run_id, "started", "Benchmark execution resumed." if resume else "Benchmark execution started.")
+        else:
+            benchmark = _load_benchmark(benchmark_id)
+            child_run = _update_benchmark_run(benchmark_id, run_id, status="running", started_at=_now_iso())
+            run = _effective_run(benchmark, child_run)
+            _append_run_event(benchmark_id, run_id, "started", "Benchmark execution resumed." if resume else "Benchmark execution started.")
+        _execute_benchmark(run, event, resume=resume)
+        current_status = str((_load_run(run_id) if legacy else _load_benchmark_run(benchmark_id, run_id)).get("status"))
+        if current_status in {"cancelled", "paused"}:
             return
-        completed_run = _load_run(run_id)
+        completed_run = _load_run(run_id) if legacy else _load_benchmark_run(benchmark_id, run_id)
         progress = dict(completed_run.get("progress") or {})
-        total_questions = int(progress.get("totalQuestions") or _result_count(_results_path(run_id)))
-        _update_run(run_id, status="completed", completed_at=_now_iso(), progress={"processedQuestions": total_questions, "totalQuestions": total_questions, "percent": 100})
-        _append_event(run_id, "completed", "Benchmark execution completed.")
+        total_questions = int(progress.get("totalQuestions") or _result_count(_results_path_for_run(run)))
+        if legacy:
+            _update_run(run_id, status="completed", completed_at=_now_iso(), progress={"processedQuestions": total_questions, "totalQuestions": total_questions, "percent": 100})
+            _append_event(run_id, "completed", "Benchmark execution completed.")
+        else:
+            _update_benchmark_run(benchmark_id, run_id, status="completed", completed_at=_now_iso(), progress={"processedQuestions": total_questions, "totalQuestions": total_questions, "percent": 100})
+            _append_run_event(benchmark_id, run_id, "completed", "Benchmark execution completed.")
     except Exception as exc:
-        _update_run(run_id, status="failed", error=str(exc))
-        _append_event(run_id, "error", str(exc), traceback=traceback.format_exc(limit=8))
+        if legacy:
+            _update_run(run_id, status="failed", error=str(exc))
+            _append_event(run_id, "error", str(exc), traceback=traceback.format_exc(limit=8))
+        else:
+            _update_benchmark_run(benchmark_id, run_id, status="failed", error=str(exc))
+            _append_run_event(benchmark_id, run_id, "error", str(exc), traceback=traceback.format_exc(limit=8))
     finally:
-        _RUNNING.pop(run_id, None)
+        _RUNNING.pop(running_key, None)
 
 
 def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resume: bool = False) -> None:
@@ -636,8 +1113,10 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
     batch_same_evidence_spans = bool(run.get("batch_same_evidence_spans", True))
     skip_evidence_above_threshold = bool(run.get("skip_evidence_above_threshold", True))
     evidence_duration_threshold = float(run.get("evidence_duration_threshold_seconds") or 25)
-    completed_qa_keys = (_completed_qa_keys_from_results(_results_path(run_id)) | _completed_qa_keys_from_events(run_id)) if resume and batch_same_evidence_spans else set()
-    resume_index = _resume_index_from_events(run_id, questions) if resume and not batch_same_evidence_spans else 0
+    results_path = _results_path_for_run(run)
+    events_path = _events_path_for_run(run)
+    completed_qa_keys = (_completed_qa_keys_from_results(results_path) | _completed_qa_keys_from_events(events_path)) if resume and batch_same_evidence_spans else set()
+    resume_index = _resume_index_from_events(events_path, questions) if resume and not batch_same_evidence_spans else 0
     processed_indices = {
         index
         for index, item in enumerate(questions)
@@ -645,13 +1124,12 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
     } if completed_qa_keys else set(range(resume_index))
     processed_count = len(processed_indices)
     percent = round(processed_count * 100 / max(1, total))
-    _update_run(run_id, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
+    _update_execution_run(run, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
     if resume:
-        _append_event(run_id, "qa_loaded", f"Loaded {total} benchmark question(s). Resuming after {processed_count} completed question(s).")
+        _append_execution_event(run, "qa_loaded", f"Loaded {total} benchmark question(s). Resuming after {processed_count} completed question(s).")
     else:
-        _append_event(run_id, "qa_loaded", f"Loaded {total} benchmark question(s).")
+        _append_execution_event(run, "qa_loaded", f"Loaded {total} benchmark question(s).")
 
-    results_path = _results_path(run_id)
     results_path.parent.mkdir(parents=True, exist_ok=True)
     if resume:
         _ensure_results_fields(results_path)
@@ -669,8 +1147,8 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
                 continue
             item = questions[index]
             if cancel_event.is_set():
-                _update_run(run_id, status="paused")
-                _append_event(run_id, "paused", "Benchmark execution paused.")
+                _update_execution_run(run, status="paused")
+                _append_execution_event(run, "paused", "Benchmark execution paused.")
                 return
             qa_id = str(item.get("id") or item.get("qa_id") or "")
             qa_key = _qa_pair_key(item)
@@ -678,9 +1156,9 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
                 processed_indices.add(index)
                 processed_count = len(processed_indices)
                 percent = round(processed_count * 100 / max(1, total))
-                _update_run(run_id, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
-                _append_event(
-                    run_id,
+                _update_execution_run(run, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
+                _append_execution_event(
+                    run,
                     "question_skipped",
                     f"Skipped QA pair {qa_id or '<unknown>'} because evidence duration exceeds {evidence_duration_threshold:g}s.",
                     qaId=qa_id,
@@ -713,16 +1191,15 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
                 handle.flush()
                 processed_count = len(processed_indices)
                 percent = round(processed_count * 100 / max(1, total))
-                _update_run(run_id, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
-                _append_event(run_id, "question_done", f"Answered question {processed_count}/{total}.", qaId=row["qa_id"], qaKey=row.get("qa_key", ""), qaFile=str(questions[item_index].get("_qa_file") or ""), percent=percent)
+                _update_execution_run(run, progress={"processedQuestions": processed_count, "totalQuestions": total, "percent": percent})
+                _append_execution_event(run, "question_done", f"Answered question {processed_count}/{total}.", qaId=row["qa_id"], qaKey=row.get("qa_key", ""), qaFile=str(questions[item_index].get("_qa_file") or ""), percent=percent)
             index += 1
 
 
-def _resume_index_from_events(run_id: str, questions: list[dict[str, Any]]) -> int:
+def _resume_index_from_events(path: Path, questions: list[dict[str, Any]]) -> int:
     last_completed_qa_key = ""
     last_completed_qa_id = ""
     completed_count = 0
-    path = _events_path(run_id)
     if path.is_file():
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -963,7 +1440,7 @@ def _max_evidence_duration_seconds(item: dict[str, Any]) -> float:
 def _answer_question(cv2: Any, litellm: Any, run: dict[str, Any], item: dict[str, Any]) -> dict[str, str]:
     video_path = _resolve_video_path(item)
     if bool(run.get("save_sample_frames", False)):
-        frame_paths = _sample_evidence_frames(cv2, video_path, item, int(run.get("frame_sample_rate") or 15), _run_dir(str(run.get("id") or "")) / "frames")
+        frame_paths = _sample_evidence_frames(cv2, video_path, item, int(run.get("frame_sample_rate") or 15), _run_dir_for_run(run) / "frames")
         messages = [{"role": "user", "content": _prompt_content(item, frame_paths)}]
     else:
         with tempfile.TemporaryDirectory(prefix="video-bench-frames-") as tmp_dir:
@@ -978,7 +1455,7 @@ def _answer_questions_batch(cv2: Any, litellm: Any, run: dict[str, Any], items: 
     if len(items) <= 1:
         return [_answer_question(cv2, litellm, run, items[0])]
     video_path = _resolve_video_path(items[0])
-    frame_dir = _run_dir(str(run.get("id") or "")) / "frames"
+    frame_dir = _run_dir_for_run(run) / "frames"
     if bool(run.get("save_sample_frames", False)):
         frame_paths = _sample_evidence_frames(cv2, video_path, items[0], int(run.get("frame_sample_rate") or 15), frame_dir)
         messages = [{"role": "user", "content": _batch_prompt_content(items, frame_paths)}]
@@ -1299,8 +1776,7 @@ def _completed_qa_keys_from_results(path: Path) -> set[str]:
         return keys
 
 
-def _completed_qa_keys_from_events(run_id: str) -> set[str]:
-    path = _events_path(run_id)
+def _completed_qa_keys_from_events(path: Path) -> set[str]:
     if not path.is_file():
         return set()
     keys: set[str] = set()
