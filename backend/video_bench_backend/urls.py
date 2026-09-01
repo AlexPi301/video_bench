@@ -40,9 +40,11 @@ from .impact_cycle import (
     upload_impact_cycle_video,
 )
 from .mounted_files import list_mounted_files, save_mounted_file, serve_mounted_file
+from .health import health
 
 
 urlpatterns = [
+    path("api/health/", health, name="health"),
     path("api/benchmarks/", list_benchmarks, name="benchmarks-list"),
     path("api/benchmarks/create/", create_benchmark, name="benchmarks-create"),
     path("api/benchmarks/runs/", list_benchmark_runs, name="benchmarks-run-list"),

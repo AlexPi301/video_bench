@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -42,10 +43,52 @@ RESULT_FIELDS = [
     "score_method",
     "model_declared_unanswerable",
 ]
-REQUEST_TIMEOUT_SEC = 2000
-MAX_TOKENS = 1200
+
+
+def _request_timeout_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("VIDEO_BENCH_REQUEST_TIMEOUT_SEC", "30")))
+    except ValueError:
+        return 300
+
+
+REQUEST_TIMEOUT_SEC = _request_timeout_seconds()
+MODEL_REQUEST_ATTEMPTS = 3
+
+
+def _max_evidence_frames() -> int:
+    try:
+        return max(1, int(os.environ.get("VIDEO_BENCH_MAX_EVIDENCE_FRAMES", "1")))
+    except ValueError:
+        return 1
+
+
+MAX_EVIDENCE_FRAMES = _max_evidence_frames()
+
+
+def _max_frame_dimension() -> int:
+    try:
+        return max(1, int(os.environ.get("VIDEO_BENCH_MAX_FRAME_DIMENSION", "768")))
+    except ValueError:
+        return 768
+
+
+MAX_FRAME_DIMENSION = _max_frame_dimension()
+
+
+def _request_cooldown_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("VIDEO_BENCH_REQUEST_COOLDOWN_SEC", "5")))
+    except ValueError:
+        return 5.0
+
+
+REQUEST_COOLDOWN_SEC = _request_cooldown_seconds()
+# Benchmark answers are a small JSON object; a large generation budget can stall reasoning-capable models.
+MAX_TOKENS = 128
 _LOCK = threading.Lock()
 _RUNNING: dict[str, threading.Event] = {}
+_MODEL_REQUEST_LOCK = threading.Lock()
 
 
 def _mounted_root() -> Path:
@@ -337,6 +380,41 @@ def _all_benchmark_runs(benchmark_id: str) -> list[dict[str, Any]]:
         except Exception:
             continue
     return runs
+
+
+def pause_running_benchmark_runs_on_startup() -> int:
+    """Recover runs abandoned by a previous backend process."""
+    try:
+        benchmarks = _all_benchmarks(include_legacy=True)
+    except Exception:
+        return 0
+
+    paused = 0
+    for benchmark in benchmarks:
+        benchmark_id = str(benchmark.get("id") or "")
+        if bool(benchmark.get("legacy", False)):
+            try:
+                run = _load_run(benchmark_id)
+                if str(run.get("status") or "") != "running":
+                    continue
+                _update_run(benchmark_id, status="paused")
+                _append_event(benchmark_id, "paused", "Benchmark execution was paused because the backend restarted.")
+                paused += 1
+            except Exception:
+                continue
+            continue
+
+        for run in list(benchmark.get("runs") or []):
+            run_id = str(run.get("id") or "")
+            if not benchmark_id or not run_id or str(run.get("status") or "") != "running":
+                continue
+            try:
+                _update_benchmark_run(benchmark_id, run_id, status="paused")
+                _append_run_event(benchmark_id, run_id, "paused", "Benchmark execution was paused because the backend restarted.")
+                paused += 1
+            except Exception:
+                continue
+    return paused
 
 
 def _legacy_benchmark_from_run(run: dict[str, Any], benchmark_id: str) -> dict[str, Any]:
@@ -1468,18 +1546,55 @@ def _answer_questions_batch(cv2: Any, litellm: Any, run: dict[str, Any], items: 
     return _complete_answers_batch(litellm, run, items, messages)
 
 
+def _request_model_completion(litellm: Any, run: dict[str, Any], items: list[dict[str, Any]], messages: list[dict[str, Any]], max_tokens: int) -> Any:
+    qa_ids = [str(item.get("id") or item.get("qa_id") or "") for item in items]
+    _append_execution_event(
+        run,
+        "question_request_started",
+        f"Sending {len(items)} QA pair(s) to the model.",
+        qaId=qa_ids[0] if len(qa_ids) == 1 else "",
+        qaIds=qa_ids,
+        qaFile=str(items[0].get("_qa_file") or "") if items else "",
+        timeoutSeconds=REQUEST_TIMEOUT_SEC,
+    )
+    model = str(run.get("model") or "").strip()
+    api_base = str(run.get("lm_studio_url") or "").strip().rstrip("/")
+    request = urllib.request.Request(
+            f"{api_base}/chat/completions",
+            data=json.dumps(
+                {
+                    "model": model.removeprefix("openai/"),
+                    "messages": messages,
+                    "temperature": 0,
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                    "reasoning_effort": "none",
+                }
+            ).encode("utf-8"),
+            headers={"Authorization": "Bearer lm-studio", "Connection": "close", "Content-Type": "application/json"},
+            method="POST",
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, MODEL_REQUEST_ATTEMPTS + 1):
+        try:
+            with _MODEL_REQUEST_LOCK:
+                with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SEC) as response:
+                    answer = _stream_completion_text(response)
+                if REQUEST_COOLDOWN_SEC:
+                    time.sleep(REQUEST_COOLDOWN_SEC)
+                return answer
+        except Exception as exc:
+            last_error = exc
+            if attempt < MODEL_REQUEST_ATTEMPTS:
+                _append_execution_event(run, "question_request_retry", f"Retrying model request ({attempt + 1}/{MODEL_REQUEST_ATTEMPTS}).", qaIds=qa_ids, error=str(exc))
+                time.sleep(REQUEST_COOLDOWN_SEC)
+    requested_ids = ", ".join(qa_id or "<unknown>" for qa_id in qa_ids)
+    raise RuntimeError(f"Model request failed for QA pair(s) {requested_ids} after {MODEL_REQUEST_ATTEMPTS} attempt(s) of up to {REQUEST_TIMEOUT_SEC}s: {last_error}") from last_error
+
+
 def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, str]:
     model = str(run.get("model") or "").strip()
-    litellm_model = model if model.startswith("openai/") else f"openai/{model}"
-    response = litellm.completion(
-        model=litellm_model,
-        api_base=str(run.get("lm_studio_url") or "").strip(),
-        api_key="lm-studio",
-        messages=messages,
-        temperature=0,
-        max_tokens=MAX_TOKENS,
-        timeout=REQUEST_TIMEOUT_SEC,
-    )
+    response = _request_model_completion(litellm, run, [item], messages, MAX_TOKENS)
     raw_answer = _completion_text(response)
     parsed = _parse_model_answer(raw_answer)
     correct = _score_answer(item, parsed)
@@ -1488,16 +1603,7 @@ def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], me
 
 def _complete_answers_batch(litellm: Any, run: dict[str, Any], items: list[dict[str, Any]], messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     model = str(run.get("model") or "").strip()
-    litellm_model = model if model.startswith("openai/") else f"openai/{model}"
-    response = litellm.completion(
-        model=litellm_model,
-        api_base=str(run.get("lm_studio_url") or "").strip(),
-        api_key="lm-studio",
-        messages=messages,
-        temperature=0,
-        max_tokens=max(MAX_TOKENS, 400 * len(items)),
-        timeout=REQUEST_TIMEOUT_SEC,
-    )
+    response = _request_model_completion(litellm, run, items, messages, max(MAX_TOKENS, 400 * len(items)))
     raw_answer = _completion_text(response)
     parsed_answers = _parse_model_answers_batch(raw_answer, items)
     rows: list[dict[str, str]] = []
@@ -1581,11 +1687,19 @@ def _sample_evidence_frames(cv2: Any, video_path: Path, item: dict[str, Any], fr
         if not selected:
             selected = [0]
         paths: list[Path] = []
-        for frame_idx in sorted(set(selected)):
+        for frame_idx in _limited_frame_indices(sorted(set(selected))):
             paths.append(_extract_frame(cv2, cap, video_path, frame_idx, frame_dir))
         return paths
     finally:
         cap.release()
+
+
+def _limited_frame_indices(indices: list[int]) -> list[int]:
+    if len(indices) <= MAX_EVIDENCE_FRAMES:
+        return indices
+    if MAX_EVIDENCE_FRAMES == 1:
+        return [indices[len(indices) // 2]]
+    return [indices[round(index * (len(indices) - 1) / (MAX_EVIDENCE_FRAMES - 1))] for index in range(MAX_EVIDENCE_FRAMES)]
 
 
 def _extract_frame(cv2: Any, cap: Any, video_path: Path, frame_idx: int, frame_dir: Path) -> Path:
@@ -1598,7 +1712,12 @@ def _extract_frame(cv2: Any, cap: Any, video_path: Path, frame_idx: int, frame_d
     ok, frame = cap.read()
     if not ok or frame is None:
         raise RuntimeError(f"Unable to extract frame {frame_idx} from {video_path.name}.")
-    if not cv2.imwrite(str(out_path), frame):
+    height, width = frame.shape[:2]
+    longest_edge = max(width, height)
+    if longest_edge > MAX_FRAME_DIMENSION:
+        scale = MAX_FRAME_DIMENSION / longest_edge
+        frame = cv2.resize(frame, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA)
+    if not cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85]):
         raise RuntimeError(f"Unable to write extracted frame: {out_path}")
     return out_path
 
@@ -1733,6 +1852,8 @@ def _bool_text(value: bool) -> str:
 
 
 def _completion_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response.strip()
     try:
         content = response["choices"][0]["message"].get("content", "")
         return content.strip() if isinstance(content, str) else str(content).strip()
@@ -1747,6 +1868,54 @@ def _completion_text(response: Any) -> str:
                 return content.strip() if isinstance(content, str) else str(content).strip()
             except Exception:
                 pass
+    return ""
+
+
+def _stream_completion_text(stream: Any) -> str:
+    parts: list[str] = []
+    for chunk in stream:
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8").strip()
+        if isinstance(chunk, str):
+            if not chunk.startswith("data:"):
+                continue
+            data = chunk.removeprefix("data:").strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+        content = _stream_chunk_content(chunk)
+        if content:
+            parts.append(content)
+    return "".join(parts).strip()
+
+
+def _stream_chunk_content(chunk: Any) -> str:
+    if isinstance(chunk, dict):
+        payload = chunk
+    else:
+        payload = None
+        for attr in ("to_dict_recursive", "model_dump", "dict"):
+            fn = getattr(chunk, attr, None)
+            if callable(fn):
+                try:
+                    payload = fn()
+                    break
+                except Exception:
+                    continue
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content") if isinstance(delta, dict) else ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
     return ""
 
 

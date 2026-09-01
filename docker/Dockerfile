@@ -26,16 +26,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN git clone --depth 1 --branch "${FLUTTER_VERSION}" https://github.com/flutter/flutter.git "${FLUTTER_HOME}"
 
-RUN flutter config --enable-web \
-    && flutter doctor -v
+RUN --mount=type=cache,id=video-bench-flutter-artifacts,target=/opt/flutter/bin/cache \
+    for attempt in 1 2 3 4 5; do \
+        flutter config --enable-web && flutter doctor -v && exit 0; \
+        echo "Flutter SDK artifact download failed (attempt ${attempt}/5); retrying..."; \
+        sleep 5; \
+    done; \
+    exit 1
 
 WORKDIR /app/frontend
 
 COPY ${APP_DIR}/frontend/pubspec.yaml ./
-RUN flutter pub get
+RUN --mount=type=cache,id=video-bench-flutter-artifacts,target=/opt/flutter/bin/cache \
+    --mount=type=cache,id=video-bench-pub-cache,target=/root/.pub-cache \
+    flutter pub get
 
 COPY ${APP_DIR}/frontend ./
-RUN flutter build web --release --base-href / --dart-define=VIDEO_BENCH_EXPERIMENTAL=${VIDEO_BENCH_EXPERIMENTAL}
+RUN --mount=type=cache,id=video-bench-flutter-artifacts,target=/opt/flutter/bin/cache \
+    --mount=type=cache,id=video-bench-pub-cache,target=/root/.pub-cache \
+    flutter build web --release --base-href / --dart-define=VIDEO_BENCH_EXPERIMENTAL=${VIDEO_BENCH_EXPERIMENTAL}
 
 FROM python:3.12-slim-bookworm AS python-builder
 
@@ -44,7 +53,7 @@ ARG APP_DIR=.
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
 COPY ${APP_DIR}/backend/requirements.txt /tmp/requirements.txt
-RUN python -m pip wheel --wheel-dir=/wheels -r /tmp/requirements.txt
+#RUN python -m pip wheel --wheel-dir=/wheels -r /tmp/requirements.txt
 
 FROM python:3.12-slim-bookworm AS runtime
 
@@ -78,10 +87,25 @@ RUN useradd --create-home --shell /usr/sbin/nologin --uid 10001 app
 
 WORKDIR /app/backend
 
-COPY --from=python-builder /wheels /wheels
+#COPY --from=python-builder /wheels /wheels
 COPY ${APP_DIR}/backend/requirements.txt /tmp/requirements.txt
-RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels -r /tmp/requirements.txt \
-    && rm -rf /wheels /tmp/requirements.txt
+RUN --mount=type=cache,id=video-bench-pip-cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=cache,id=video-bench-python-wheels,target=/wheels,sharing=locked \
+    torch_url=$(python -c 'import json, urllib.request; data = json.load(urllib.request.urlopen("https://pypi.org/pypi/torch/2.5.1/json", timeout=30)); print(next(item["url"] for item in data["urls"] if item["filename"] == "torch-2.5.1-cp312-cp312-manylinux2014_aarch64.whl"))') \
+    && downloaded=0; for attempt in 1 2 3 4 5 6 7 8 9 10; do \
+        if wget --continue --timeout=30 --tries=1 --output-document=/wheels/torch-2.5.1-cp312-cp312-manylinux2014_aarch64.whl "$torch_url"; then downloaded=1; break; fi; \
+        echo "Torch wheel download failed (attempt ${attempt}/10); retrying..."; \
+        sleep 5; \
+    done; test "$downloaded" -eq 1 \
+    && for attempt in 1 2 3 4 5; do \
+        python -m pip install /wheels/torch-2.5.1-cp312-cp312-manylinux2014_aarch64.whl \
+        && grep -v '^torch==' /tmp/requirements.txt > /tmp/requirements-without-torch.txt \
+        && python -m pip install --timeout=120 --retries=5 -r /tmp/requirements-without-torch.txt && exit 0; \
+        echo "Python dependency download failed (attempt ${attempt}/5); retrying..."; \
+        sleep 5; \
+    done; \
+    exit 1
+# \   && rm -rf /wheels /tmp/requirements.txt
 
 COPY ${APP_DIR}/docker/nginx.conf /etc/nginx/conf.d/default.conf
 COPY ${APP_DIR}/docker/docker-entrypoint.d/40-video-bench-debug-config.sh /docker-entrypoint.d/40-video-bench-debug-config.sh
@@ -96,6 +120,6 @@ RUN mkdir -p /data /data/impact-cycle \
 EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget -qO- http://127.0.0.1/ >/dev/null || exit 1
+  CMD wget -qO- http://127.0.0.1/api/health/ >/dev/null || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
