@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 # Video Bench
 
 A web application for benchmarking the video understanding capabilities of Visual Language Models (VLMs) that directly accept video as input. Video Bench supports the full benchmarking lifecycle &mdash; from automatic object detection and captioning to QA-pair generation, annotation review, and evaluation &mdash; in a single containerized tool.
@@ -120,6 +123,51 @@ docker ps --filter name=video-bench
 docker logs video-bench
 ```
 
+## Local production deployment with Podman
+
+Podman can build and run the production Dockerfile directly; Docker is not required. Run these commands as your regular user from the
+repository root. This branch currently downloads an ARM64 PyTorch wheel and
+therefore requires a Linux ARM64 build/runtime host.
+
+```bash
+podman build --format docker --layers -t localhost/video-bench:hans-dev -f docker/Dockerfile .
+podman run -d \
+  --name video-bench \
+  -p 127.0.0.1:8080:80 \
+  -v video-bench-data:/data \
+  -v video-bench-input:/mounted-input \
+  -e VIDEO_BENCH_MAX_EVIDENCE_FRAMES=30 \
+  -e VIDEO_BENCH_REQUEST_TIMEOUT_SEC=180 \
+  --restart unless-stopped \
+  localhost/video-bench:hans-dev
+```
+
+The `--format docker` option preserves the Dockerfile health check, which
+Podman otherwise omits in its default OCI image format.
+The evidence-frame limit applies to each benchmark model request; the longer
+timeout allows LM Studio to process requests containing up to 30 frames.
+
+Open <http://localhost:8080/>. The UI is published on the local host only.
+The named volumes persist application data and provide an initially empty
+input directory. To use existing videos instead, replace the input volume
+with `-v /absolute/path/to/input:/mounted-input:ro,Z` (omit `ro` when editing
+annotations is intended). Use a dedicated input directory because `Z` applies
+a private SELinux label where SELinux is enabled.
+
+Verify the backend and inspect container health:
+
+```bash
+curl --fail http://127.0.0.1:8080/api/health/
+podman healthcheck run video-bench
+podman inspect --format '{{.State.Health.Status}}' video-bench
+podman logs video-bench
+```
+
+For later starts and stops, use `podman start video-bench` and
+`podman stop video-bench`. The volumes survive container removal. If using
+LM Studio on the host, configure its URL with Podman's `host.containers.internal`
+hostname and ensure the server accepts connections from the container.
+
 ## Configuration
 
 ### Required volume mounts
@@ -140,6 +188,8 @@ Override these with `-e` on `docker run`:
 | `DJANGO_DB_PATH` | `/data/db.sqlite3` | SQLite database location inside the container. |
 | `VIDEO_BENCH_MOUNTED_FILES_ROOT` | `/mounted-input` | Root directory for browsing and serving mounted input files. |
 | `VIDEO_BENCH_IMPACT_CYCLE_ROOT` | `/data/impact-cycle` | Root directory for IMPACT_CYCLE uploads, runs, and job metadata. |
+| `VIDEO_BENCH_MAX_EVIDENCE_FRAMES` | `1` | Maximum sampled video frames sent in one benchmark model request. Set to `-1` for no upper limit; the Podman example sets this to `30`. Frame sampling still follows `frame_sample_rate`. |
+| `VIDEO_BENCH_REQUEST_TIMEOUT_SEC` | `30` | Timeout for each benchmark model request in seconds; the Podman example sets this to `180`. |
 | `GUNICORN_WORKERS` | `2` | Gunicorn worker process count. |
 | `GUNICORN_THREADS` | `2` | Gunicorn threads per worker. |
 | `GUNICORN_TIMEOUT` | `120` | Gunicorn worker timeout in seconds. |

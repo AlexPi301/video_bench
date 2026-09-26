@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 # Production image for Video Bench Flutter web frontend, Django backend, and nginx.
 # syntax=docker/dockerfile:1.7
 
@@ -11,7 +14,10 @@ ARG APP_DIR=.
 ARG FLUTTER_VERSION=3.38.8
 ARG VIDEO_BENCH_EXPERIMENTAL=false
 
-ENV FLUTTER_HOME=/opt/flutter \
+# Flutter archives can contain UIDs outside rootless Podman's user namespace.
+# Keep extracted SDK artifacts owned by the user performing the build.
+ENV TAR_OPTIONS=--no-same-owner \
+    FLUTTER_HOME=/opt/flutter \
     PATH="/opt/flutter/bin:/opt/flutter/bin/cache/dart-sdk/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

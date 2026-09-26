@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 """HTTP API and worker for Video Bench benchmark runs."""
 
 from __future__ import annotations
@@ -58,7 +61,8 @@ MODEL_REQUEST_ATTEMPTS = 3
 
 def _max_evidence_frames() -> int:
     try:
-        return max(1, int(os.environ.get("VIDEO_BENCH_MAX_EVIDENCE_FRAMES", "1")))
+        configured = int(os.environ.get("VIDEO_BENCH_MAX_EVIDENCE_FRAMES", "1"))
+        return -1 if configured == -1 else max(1, configured)
     except ValueError:
         return 1
 
@@ -1594,18 +1598,30 @@ def _request_model_completion(litellm: Any, run: dict[str, Any], items: list[dic
 
 def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, str]:
     model = str(run.get("model") or "").strip()
-    response = _request_model_completion(litellm, run, [item], messages, MAX_TOKENS)
-    raw_answer = _completion_text(response)
-    parsed = _parse_model_answer(raw_answer)
-    correct = _score_answer(item, parsed)
-    return _benchmark_result_row(item, model, raw_answer, parsed, correct)
+    for max_tokens in (MAX_TOKENS, 512, 1024):
+        response = _request_model_completion(litellm, run, [item], messages, max_tokens)
+        raw_answer = _completion_text(response)
+        parsed = _parse_model_answer(raw_answer)
+        if parsed.get("unanswerable") or _answer_text(parsed.get("answer")).strip():
+            correct = _score_answer(item, parsed)
+            return _benchmark_result_row(item, model, raw_answer, parsed, correct)
+        _append_execution_event(run, "question_response_retry", "Model response contained no answer; retrying with a larger output limit.", qaId=str(item.get("id") or item.get("qa_id") or ""), maxTokens=max_tokens)
+    raise RuntimeError(f"Model did not answer QA pair {item.get('id') or item.get('qa_id') or '<unknown>'}.")
 
 
 def _complete_answers_batch(litellm: Any, run: dict[str, Any], items: list[dict[str, Any]], messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     model = str(run.get("model") or "").strip()
     response = _request_model_completion(litellm, run, items, messages, max(MAX_TOKENS, 400 * len(items)))
     raw_answer = _completion_text(response)
-    parsed_answers = _parse_model_answers_batch(raw_answer, items)
+    try:
+        parsed_answers = _parse_model_answers_batch(raw_answer, items)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        _append_execution_event(run, "question_batch_fallback", "Batched response was incomplete; asking each question separately.", qaIds=[str(item.get("id") or item.get("qa_id") or "") for item in items], error=str(exc))
+        shared_images = list(messages[0].get("content") or [])[1:]
+        return [
+            _complete_answer(litellm, run, item, [{"role": "user", "content": _prompt_content(item, []) + shared_images}])
+            for item in items
+        ]
     rows: list[dict[str, str]] = []
     for item in items:
         qa_id = str(item.get("id") or item.get("qa_id") or "")
@@ -1695,7 +1711,7 @@ def _sample_evidence_frames(cv2: Any, video_path: Path, item: dict[str, Any], fr
 
 
 def _limited_frame_indices(indices: list[int]) -> list[int]:
-    if len(indices) <= MAX_EVIDENCE_FRAMES:
+    if MAX_EVIDENCE_FRAMES == -1 or len(indices) <= MAX_EVIDENCE_FRAMES:
         return indices
     if MAX_EVIDENCE_FRAMES == 1:
         return [indices[len(indices) // 2]]
@@ -1770,16 +1786,59 @@ def _batch_prompt_content(items: list[dict[str, Any]], frame_paths: list[Path]) 
     return content
 
 
+def _model_json_objects(text: str):
+    """Read separate JSON objects without merging repeated/fenced responses."""
+    decoder = json.JSONDecoder()
+    offset = 0
+    while (start := text.find("{", offset)) != -1:
+        try:
+            payload, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            # Some LM Studio responses omit only the final closing delimiter.
+            # Accept that narrow case, but never invent an answer or a value.
+            unfinished = text[start:].strip().removesuffix("```").strip()
+            stack: list[str] = []
+            quoted = escaped = invalid = False
+            for char in unfinished:
+                if quoted:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        quoted = False
+                elif char == '"':
+                    quoted = True
+                elif char in "{[":
+                    stack.append("}" if char == "{" else "]")
+                elif char in "}]":
+                    if not stack or stack.pop() != char:
+                        invalid = True
+                        break
+            if not invalid and not quoted and stack:
+                try:
+                    repaired = json.loads(unfinished + "".join(reversed(stack)))
+                    if isinstance(repaired, dict):
+                        yield repaired
+                        break
+                except json.JSONDecodeError:
+                    pass
+            offset = start + 1
+            continue
+        offset = end
+        if isinstance(payload, dict):
+            yield payload
+
+
 def _parse_model_answer(raw: str) -> dict[str, Any]:
     text = raw.strip()
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    if match:
-        try:
-            payload = json.loads(match.group(0))
-            if isinstance(payload, dict):
-                return {"answer": payload.get("answer"), "unanswerable": bool(payload.get("unanswerable", False))}
-        except Exception:
-            pass
+    for payload in _model_json_objects(text):
+        if isinstance(payload.get("json"), dict):
+            payload = payload["json"]
+        if "answer" in payload or "unanswerable" in payload:
+            return {"answer": payload.get("answer"), "unanswerable": bool(payload.get("unanswerable", False))}
+    if text.startswith(("{", "```json")):
+        return {"answer": None, "unanswerable": False}
     lowered = text.lower()
     if "unanswerable" in lowered or "cannot determine" in lowered or "not enough evidence" in lowered:
         return {"answer": None, "unanswerable": True}
@@ -1792,11 +1851,8 @@ def _parse_model_answer(raw: str) -> dict[str, Any]:
 
 def _parse_model_answers_batch(raw: str, items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     text = raw.strip()
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    if not match:
-        raise RuntimeError("Batched model response did not contain a JSON object.")
-    payload = json.loads(match.group(0))
-    if not isinstance(payload, dict) or not isinstance(payload.get("answers"), list):
+    payload = next((value for value in _model_json_objects(text) if isinstance(value.get("answers"), list)), None)
+    if payload is None:
         raise RuntimeError("Batched model response must contain an answers list.")
     expected_ids = {str(item.get("id") or item.get("qa_id") or "") for item in items}
     parsed: dict[str, dict[str, Any]] = {}
@@ -1807,6 +1863,10 @@ def _parse_model_answers_batch(raw: str, items: list[dict[str, Any]]) -> dict[st
         if qa_id not in expected_ids:
             continue
         parsed[qa_id] = {"answer": answer_item.get("answer"), "unanswerable": bool(answer_item.get("unanswerable", False))}
+    if set(parsed) != expected_ids:
+        raise RuntimeError("Batched model response did not include every QA pair.")
+    if any(not answer["unanswerable"] and not _answer_text(answer["answer"]).strip() for answer in parsed.values()):
+        raise RuntimeError("Batched model response contained an empty answer.")
     return parsed
 
 
