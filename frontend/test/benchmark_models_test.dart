@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 import 'package:flutter_test/flutter_test.dart';
 import 'package:video_bench_frontend/models/benchmark_models.dart';
 import 'package:video_bench_frontend/services/benchmarks_client.dart';

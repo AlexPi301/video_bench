@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 # Video Bench
 
 A web application for benchmarking the video understanding capabilities of Visual Language Models (VLMs) that directly accept video as input. Video Bench supports the full benchmarking lifecycle &mdash; from automatic object detection and captioning to QA-pair generation, annotation review, and evaluation &mdash; in a single containerized tool.

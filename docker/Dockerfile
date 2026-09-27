@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 # Production image for Video Bench Flutter web frontend, Django backend, and nginx.
 # syntax=docker/dockerfile:1.7
 

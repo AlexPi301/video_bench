@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 """HTTP API and worker for Video Bench benchmark runs."""
 
 from __future__ import annotations
