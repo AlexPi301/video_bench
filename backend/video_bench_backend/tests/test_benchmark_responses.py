@@ -1,9 +1,13 @@
 Failed to create stream fd: Operation not permitted
 Failed to create stream fd: Operation not permitted
 Failed to create stream fd: Operation not permitted
+import csv
 import json
+import tempfile
+import threading
+from pathlib import Path
 from unittest.mock import patch
-from django.test import SimpleTestCase
+from django.test import Client, SimpleTestCase
 from video_bench_backend import benchmarks
 from video_bench_backend.benchmarks import _parse_model_answer, _parse_model_answers_batch
 
@@ -89,3 +93,151 @@ class EvidenceFrameLimitTests(SimpleTestCase):
         for value in ("0", "-2"):
             with self.subTest(value=value), patch.dict(benchmarks.os.environ, {"VIDEO_BENCH_MAX_EVIDENCE_FRAMES": value}):
                 self.assertEqual(benchmarks._max_evidence_frames(), 1)
+
+
+class MaxQaPairsPerVideoTests(SimpleTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        (self.root / "video_a").mkdir()
+        (self.root / "video_b").mkdir()
+        (self.root / "video_a" / "qa_pairs.json").write_text('{"qa_pairs": []}', encoding="utf-8")
+        (self.root / "video_b" / "qa_pairs.json").write_text('{"qa_pairs": []}', encoding="utf-8")
+        self.client = Client()
+
+    def test_limit_is_per_file_and_evidence_skips_do_not_consume_allowance(self):
+        def item(qa_id, qa_file, span_seconds=1):
+            return {
+                "id": qa_id,
+                "_qa_file": qa_file,
+                "evidence_spans": [{"start_seconds": 0, "end_seconds": span_seconds}],
+            }
+
+        questions = [
+            item("a-long-first", "a/qa_pairs.json", 10),
+            item("a-1", "a/qa_pairs.json"),
+            item("a-2", "a/qa_pairs.json"),
+            item("a-after-cap-long", "a/qa_pairs.json", 10),
+            item("a-after-cap", "a/qa_pairs.json"),
+            item("b-1", "b/qa_pairs.json"),
+            item("b-2", "b/qa_pairs.json"),
+            item("b-after-cap", "b/qa_pairs.json"),
+        ]
+
+        limited = benchmarks._limit_qa_pairs_per_file(
+            questions,
+            2,
+            skip_evidence_above_threshold=True,
+            evidence_duration_threshold=5,
+        )
+
+        self.assertEqual([item["id"] for item in limited], ["a-long-first", "a-1", "a-2", "b-1", "b-2"])
+
+    def test_unlimited_keeps_every_question(self):
+        questions = [{"id": "one", "_qa_file": "a"}, {"id": "two", "_qa_file": "a"}]
+        self.assertIs(benchmarks._limit_qa_pairs_per_file(questions, -1, skip_evidence_above_threshold=False, evidence_duration_threshold=5), questions)
+
+    def test_execution_caps_model_calls_per_file_and_continues_to_next_file(self):
+        questions = [
+            {"id": "a-skipped", "_qa_file": "a/qa_pairs.json", "evidence_spans": [{"start_seconds": 0, "end_seconds": 10}]},
+            {"id": "a-1", "_qa_file": "a/qa_pairs.json", "evidence_spans": []},
+            {"id": "a-after-cap", "_qa_file": "a/qa_pairs.json", "evidence_spans": []},
+            {"id": "b-1", "_qa_file": "b/qa_pairs.json", "evidence_spans": []},
+            {"id": "b-after-cap", "_qa_file": "b/qa_pairs.json", "evidence_spans": []},
+        ]
+        results_path = self.root / "results.csv"
+        evaluated = []
+
+        def answer(_cv2, _litellm, _run, item):
+            evaluated.append(item["id"])
+            return {"qa_id": item["id"]}
+
+        with (
+            patch.object(benchmarks, "_import_required", return_value=object()),
+            patch.object(benchmarks, "_load_all_questions", return_value=questions),
+            patch.object(benchmarks, "_answer_question", side_effect=answer),
+            patch.object(benchmarks, "_results_path_for_run", return_value=results_path),
+            patch.object(benchmarks, "_events_path_for_run", return_value=self.root / "events.jsonl"),
+            patch.object(benchmarks, "_update_execution_run"),
+            patch.object(benchmarks, "_append_execution_event"),
+        ):
+            benchmarks._execute_benchmark(
+                {
+                    "id": "run",
+                    "qa_files": ["a/qa_pairs.json", "b/qa_pairs.json"],
+                    "max_qa_pairs_per_video": 1,
+                    "batch_same_evidence_spans": False,
+                    "skip_evidence_above_threshold": True,
+                    "evidence_duration_threshold_seconds": 5,
+                },
+                threading.Event(),
+            )
+
+        self.assertEqual(evaluated, ["a-1", "b-1"])
+        with results_path.open(encoding="utf-8", newline="") as handle:
+            self.assertEqual([row["qa_id"] for row in csv.DictReader(handle)], ["a-1", "b-1"])
+
+    def test_batch_at_file_limit_contains_only_remaining_allowed_pairs(self):
+        questions = [
+            {"id": f"qa-{index}", "_qa_file": "a/qa_pairs.json", "video_id": "video-a", "evidence_spans": [{"start_seconds": 1, "end_seconds": 2}]}
+            for index in range(4)
+        ]
+        batch_calls = []
+
+        def answer_batch(_cv2, _litellm, _run, items):
+            batch_calls.append([item["id"] for item in items])
+            return [{"qa_id": item["id"]} for item in items]
+
+        with (
+            patch.object(benchmarks, "_import_required", return_value=object()),
+            patch.object(benchmarks, "_load_all_questions", return_value=questions),
+            patch.object(benchmarks, "_answer_questions_batch", side_effect=answer_batch),
+            patch.object(benchmarks, "_results_path_for_run", return_value=self.root / "batch-results.csv"),
+            patch.object(benchmarks, "_events_path_for_run", return_value=self.root / "batch-events.jsonl"),
+            patch.object(benchmarks, "_update_execution_run"),
+            patch.object(benchmarks, "_append_execution_event"),
+        ):
+            benchmarks._execute_benchmark(
+                {
+                    "id": "batch-run",
+                    "qa_files": ["a/qa_pairs.json"],
+                    "max_qa_pairs_per_video": 2,
+                    "batch_same_evidence_spans": True,
+                    "skip_evidence_above_threshold": False,
+                },
+                threading.Event(),
+            )
+
+        self.assertEqual(batch_calls, [["qa-0", "qa-1"]])
+
+    def test_create_defaults_to_unlimited_and_update_persists_limit(self):
+        with patch.object(benchmarks, "_mounted_root", return_value=self.root):
+            created = self.client.post(
+                "/api/benchmarks/create/",
+                data=json.dumps({"name": "test", "qaFiles": ["video_a/qa_pairs.json"]}),
+                content_type="application/json",
+            )
+            self.assertEqual(created.status_code, 201, created.content)
+            benchmark = created.json()
+            self.assertEqual(benchmark["max_qa_pairs_per_video"], -1)
+
+            updated = self.client.post(
+                f"/api/benchmarks/{benchmark['id']}/edit/",
+                data=json.dumps({"name": "test", "qaFiles": ["video_a/qa_pairs.json"], "maxQaPairsPerVideo": 4}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(updated.status_code, 200, updated.content)
+        self.assertEqual(updated.json()["max_qa_pairs_per_video"], 4)
+
+    def test_create_rejects_invalid_limit_values(self):
+        with patch.object(benchmarks, "_mounted_root", return_value=self.root):
+            for value in (0, -2, 2.5, True, "2"):
+                with self.subTest(value=value):
+                    response = self.client.post(
+                        "/api/benchmarks/create/",
+                        data=json.dumps({"name": "test", "qaFiles": ["video_a/qa_pairs.json"], "maxQaPairsPerVideo": value}),
+                        content_type="application/json",
+                    )
+                    self.assertEqual(response.status_code, 400)

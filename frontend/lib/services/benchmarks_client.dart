@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 import 'dart:convert';
 import 'dart:html' as html;
 
@@ -11,6 +14,7 @@ class BenchmarkCreateRequest {
     required this.description,
     required this.lmStudioUrl,
     required this.frameSampleRate,
+    required this.maxQaPairsPerVideo,
     required this.saveSampleFrames,
     required this.batchSameEvidenceSpans,
     required this.skipEvidenceAboveThreshold,
@@ -25,6 +29,7 @@ class BenchmarkCreateRequest {
   final String description;
   final String lmStudioUrl;
   final int frameSampleRate;
+  final int maxQaPairsPerVideo;
   final bool saveSampleFrames;
   final bool batchSameEvidenceSpans;
   final bool skipEvidenceAboveThreshold;
@@ -39,6 +44,7 @@ class BenchmarkCreateRequest {
         'description': description,
         'lmStudioUrl': lmStudioUrl,
         'frameSampleRate': frameSampleRate,
+        'maxQaPairsPerVideo': maxQaPairsPerVideo,
         'saveSampleFrames': saveSampleFrames,
         'batchSameEvidenceSpans': batchSameEvidenceSpans,
         'skipEvidenceAboveThreshold': skipEvidenceAboveThreshold,

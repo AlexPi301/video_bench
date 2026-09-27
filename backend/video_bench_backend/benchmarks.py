@@ -430,6 +430,7 @@ def _legacy_benchmark_from_run(run: dict[str, Any], benchmark_id: str) -> dict[s
         "description": str(run.get("description") or ""),
         "lm_studio_url": str(run.get("lm_studio_url") or ""),
         "frame_sample_rate": int(run.get("frame_sample_rate") or 15),
+        "max_qa_pairs_per_video": int(run.get("max_qa_pairs_per_video", -1)),
         "save_sample_frames": bool(run.get("save_sample_frames", False)),
         "batch_same_evidence_spans": bool(run.get("batch_same_evidence_spans", True)),
         "skip_evidence_above_threshold": bool(run.get("skip_evidence_above_threshold", True)),
@@ -502,6 +503,15 @@ def _bool_payload(payload: dict[str, Any], key: str, default: bool = False) -> b
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _validated_max_qa_pairs_per_video(payload: dict[str, Any], default: int = -1) -> tuple[int | None, JsonResponse | None]:
+    value = payload.get("maxQaPairsPerVideo", default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, JsonResponse({"error": "Max QA pairs per video must be an integer."}, status=400)
+    if value != -1 and value < 1:
+        return None, JsonResponse({"error": "Max QA pairs per video must be -1 or a positive integer."}, status=400)
+    return value, None
+
+
 @csrf_exempt
 @require_POST
 def create_benchmark(request: HttpRequest) -> JsonResponse:
@@ -514,6 +524,9 @@ def create_benchmark(request: HttpRequest) -> JsonResponse:
     if not name:
         return JsonResponse({"error": "Name is required."}, status=400)
     qa_files, error = _validated_qa_files(payload)
+    if error is not None:
+        return error
+    max_qa_pairs_per_video, error = _validated_max_qa_pairs_per_video(payload)
     if error is not None:
         return error
     output_folder, error = _validated_output_folder(payload)
@@ -540,6 +553,7 @@ def create_benchmark(request: HttpRequest) -> JsonResponse:
         "description": str(payload.get("description") or ""),
         "lm_studio_url": str(payload.get("lmStudioUrl") or "http://host.docker.internal:1234/v1").strip(),
         "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
+        "max_qa_pairs_per_video": max_qa_pairs_per_video,
         "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
         "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
         "skip_evidence_above_threshold": _bool_payload(payload, "skipEvidenceAboveThreshold", True),
@@ -591,6 +605,12 @@ def update_benchmark(request: HttpRequest, benchmark_id: str) -> JsonResponse:
     qa_files, error = _validated_qa_files(payload)
     if error is not None:
         return error
+    max_qa_pairs_per_video, error = _validated_max_qa_pairs_per_video(
+        payload,
+        default=int(benchmark.get("max_qa_pairs_per_video", -1)),
+    )
+    if error is not None:
+        return error
     output_folder, error = _validated_output_folder(payload)
     if error is not None:
         return error
@@ -601,6 +621,7 @@ def update_benchmark(request: HttpRequest, benchmark_id: str) -> JsonResponse:
         "description": str(payload.get("description") or ""),
         "lm_studio_url": str(payload.get("lmStudioUrl") or "http://host.docker.internal:1234/v1").strip(),
         "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
+        "max_qa_pairs_per_video": max_qa_pairs_per_video,
         "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
         "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
         "skip_evidence_above_threshold": _bool_payload(payload, "skipEvidenceAboveThreshold", True),
@@ -868,6 +889,7 @@ def get_benchmark_run_events(request: HttpRequest, run_id: str, benchmark_id: st
 
 def _benchmark_response(benchmark: dict[str, Any]) -> dict[str, Any]:
     out = dict(benchmark)
+    out.setdefault("max_qa_pairs_per_video", -1)
     out.pop("run_dir", None)
     runs = _all_benchmark_runs(str(benchmark.get("id") or "")) if not bool(benchmark.get("legacy", False)) else list(benchmark.get("runs") or [])
     out["runs"] = [_benchmark_run_response(benchmark, run) for run in runs if isinstance(run, dict)]
@@ -1191,10 +1213,17 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
     litellm = _import_required("litellm", "LiteLLM is required for LM Studio benchmark calls.")
     run_id = str(run.get("id") or "")
     questions = _load_all_questions(list(run.get("qa_files") or []))
-    total = len(questions)
     batch_same_evidence_spans = bool(run.get("batch_same_evidence_spans", True))
     skip_evidence_above_threshold = bool(run.get("skip_evidence_above_threshold", True))
     evidence_duration_threshold = float(run.get("evidence_duration_threshold_seconds") or 25)
+    max_qa_pairs_per_video = int(run.get("max_qa_pairs_per_video", -1))
+    questions = _limit_qa_pairs_per_file(
+        questions,
+        max_qa_pairs_per_video,
+        skip_evidence_above_threshold=skip_evidence_above_threshold,
+        evidence_duration_threshold=evidence_duration_threshold,
+    )
+    total = len(questions)
     results_path = _results_path_for_run(run)
     events_path = _events_path_for_run(run)
     completed_qa_keys = (_completed_qa_keys_from_results(results_path) | _completed_qa_keys_from_events(events_path)) if resume and batch_same_evidence_spans else set()
@@ -1353,6 +1382,45 @@ def _load_all_questions(qa_files: list[str]) -> list[dict[str, Any]]:
                 item["_qa_file"] = rel_path
                 items.append(item)
     return items
+
+
+def _limit_qa_pairs_per_file(
+    questions: list[dict[str, Any]],
+    maximum: int,
+    *,
+    skip_evidence_above_threshold: bool,
+    evidence_duration_threshold: float,
+) -> list[dict[str, Any]]:
+    """Cap model-evaluated QA pairs independently per selected QA file.
+
+    Evidence pairs that will already be skipped do not consume the allowance.
+    Keeping those rows in the returned sequence preserves existing skip events
+    and progress behavior for questions encountered before the cap is reached.
+    """
+    if maximum == -1:
+        return questions
+
+    selected: list[dict[str, Any]] = []
+    evaluated_by_file: dict[str, int] = {}
+    exhausted_files: set[str] = set()
+    for item in questions:
+        qa_file = str(item.get("_qa_file") or "")
+        if qa_file in exhausted_files:
+            continue
+        if skip_evidence_above_threshold and _qa_pair_exceeds_evidence_threshold(item, evidence_duration_threshold):
+            selected.append(item)
+            continue
+
+        evaluated = evaluated_by_file.get(qa_file, 0)
+        if evaluated >= maximum:
+            exhausted_files.add(qa_file)
+            continue
+        selected.append(item)
+        evaluated += 1
+        evaluated_by_file[qa_file] = evaluated
+        if evaluated >= maximum:
+            exhausted_files.add(qa_file)
+    return selected
 
 
 def _qa_pair_key(item: dict[str, Any]) -> str:
