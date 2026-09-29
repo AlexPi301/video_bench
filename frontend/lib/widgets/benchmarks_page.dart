@@ -142,7 +142,7 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
 
   Widget _buildRunList(Benchmark benchmark) {
     if (benchmark.runs.isEmpty) return const Center(child: Text('No benchmark runs yet.'));
-    return ListView.separated(scrollDirection: Axis.horizontal, itemCount: benchmark.runs.length, separatorBuilder: (_, __) => const SizedBox(width: 8), itemBuilder: (context, index) { final run = benchmark.runs[index]; final selected = run.selectionKey == _run?.selectionKey; return SizedBox(width: 280, child: Card.filled(color: selected ? Theme.of(context).colorScheme.primaryContainer : null, child: ListTile(selected: selected, title: Text(run.model, maxLines: 1, overflow: TextOverflow.ellipsis), subtitle: Text('${run.status} - ${run.isRunning ? '${run.progress.percent}%' : '${run.metrics.total.percent.toStringAsFixed(1)}%'}'), onTap: () => _selectRun(run)))); });
+    return ListView.separated(scrollDirection: Axis.horizontal, itemCount: benchmark.runs.length, separatorBuilder: (_, __) => const SizedBox(width: 8), itemBuilder: (context, index) { final run = benchmark.runs[index]; final selected = run.selectionKey == _run?.selectionKey; return SizedBox(width: 280, child: Card.filled(color: selected ? Theme.of(context).colorScheme.primaryContainer : null, child: ListTile(selected: selected, selectedColor: Theme.of(context).colorScheme.onPrimaryContainer, title: Text(run.model, maxLines: 1, overflow: TextOverflow.ellipsis), subtitle: Text('${run.status} - ${run.isRunning ? '${run.progress.percent}%' : '${run.metrics.total.percent.toStringAsFixed(1)}%'}'), onTap: () => _selectRun(run)))); });
   }
 
   Future<void> _refresh() async {
