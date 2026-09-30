@@ -7,6 +7,7 @@ class Benchmark {
     required this.description,
     required this.lmStudioUrl,
     required this.frameSampleRate,
+    required this.maxQaPairsPerVideo,
     required this.saveSampleFrames,
     required this.batchSameEvidenceSpans,
     required this.skipEvidenceAboveThreshold,
@@ -24,6 +25,7 @@ class Benchmark {
   final String description;
   final String lmStudioUrl;
   final int frameSampleRate;
+  final int maxQaPairsPerVideo;
   final bool saveSampleFrames;
   final bool batchSameEvidenceSpans;
   final bool skipEvidenceAboveThreshold;
@@ -45,6 +47,7 @@ class Benchmark {
       description: json['description']?.toString() ?? '',
       lmStudioUrl: json['lm_studio_url']?.toString() ?? json['lmStudioUrl']?.toString() ?? '',
       frameSampleRate: _int(json['frame_sample_rate'] ?? json['frameSampleRate']),
+      maxQaPairsPerVideo: _int(json['max_qa_pairs_per_video'] ?? json['maxQaPairsPerVideo'] ?? -1),
       saveSampleFrames: json['save_sample_frames'] == true || json['saveSampleFrames'] == true,
       batchSameEvidenceSpans: json['batch_same_evidence_spans'] != false && json['batchSameEvidenceSpans'] != false,
       skipEvidenceAboveThreshold: json['skip_evidence_above_threshold'] != false && json['skipEvidenceAboveThreshold'] != false,

@@ -58,7 +58,8 @@ MODEL_REQUEST_ATTEMPTS = 3
 
 def _max_evidence_frames() -> int:
     try:
-        return max(1, int(os.environ.get("VIDEO_BENCH_MAX_EVIDENCE_FRAMES", "1")))
+        configured = int(os.environ.get("VIDEO_BENCH_MAX_EVIDENCE_FRAMES", "1"))
+        return -1 if configured == -1 else max(1, configured)
     except ValueError:
         return 1
 
@@ -426,6 +427,7 @@ def _legacy_benchmark_from_run(run: dict[str, Any], benchmark_id: str) -> dict[s
         "description": str(run.get("description") or ""),
         "lm_studio_url": str(run.get("lm_studio_url") or ""),
         "frame_sample_rate": int(run.get("frame_sample_rate") or 15),
+        "max_qa_pairs_per_video": int(run.get("max_qa_pairs_per_video", -1)),
         "save_sample_frames": bool(run.get("save_sample_frames", False)),
         "batch_same_evidence_spans": bool(run.get("batch_same_evidence_spans", True)),
         "skip_evidence_above_threshold": bool(run.get("skip_evidence_above_threshold", True)),
@@ -498,6 +500,15 @@ def _bool_payload(payload: dict[str, Any], key: str, default: bool = False) -> b
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _validated_max_qa_pairs_per_video(payload: dict[str, Any], default: int = -1) -> tuple[int | None, JsonResponse | None]:
+    value = payload.get("maxQaPairsPerVideo", default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, JsonResponse({"error": "Max QA pairs per video must be an integer."}, status=400)
+    if value != -1 and value < 1:
+        return None, JsonResponse({"error": "Max QA pairs per video must be -1 or a positive integer."}, status=400)
+    return value, None
+
+
 @csrf_exempt
 @require_POST
 def create_benchmark(request: HttpRequest) -> JsonResponse:
@@ -510,6 +521,9 @@ def create_benchmark(request: HttpRequest) -> JsonResponse:
     if not name:
         return JsonResponse({"error": "Name is required."}, status=400)
     qa_files, error = _validated_qa_files(payload)
+    if error is not None:
+        return error
+    max_qa_pairs_per_video, error = _validated_max_qa_pairs_per_video(payload)
     if error is not None:
         return error
     output_folder, error = _validated_output_folder(payload)
@@ -536,6 +550,7 @@ def create_benchmark(request: HttpRequest) -> JsonResponse:
         "description": str(payload.get("description") or ""),
         "lm_studio_url": str(payload.get("lmStudioUrl") or "http://host.docker.internal:1234/v1").strip(),
         "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
+        "max_qa_pairs_per_video": max_qa_pairs_per_video,
         "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
         "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
         "skip_evidence_above_threshold": _bool_payload(payload, "skipEvidenceAboveThreshold", True),
@@ -587,6 +602,12 @@ def update_benchmark(request: HttpRequest, benchmark_id: str) -> JsonResponse:
     qa_files, error = _validated_qa_files(payload)
     if error is not None:
         return error
+    max_qa_pairs_per_video, error = _validated_max_qa_pairs_per_video(
+        payload,
+        default=int(benchmark.get("max_qa_pairs_per_video", -1)),
+    )
+    if error is not None:
+        return error
     output_folder, error = _validated_output_folder(payload)
     if error is not None:
         return error
@@ -597,6 +618,7 @@ def update_benchmark(request: HttpRequest, benchmark_id: str) -> JsonResponse:
         "description": str(payload.get("description") or ""),
         "lm_studio_url": str(payload.get("lmStudioUrl") or "http://host.docker.internal:1234/v1").strip(),
         "frame_sample_rate": max(1, int(payload.get("frameSampleRate") or 15)),
+        "max_qa_pairs_per_video": max_qa_pairs_per_video,
         "save_sample_frames": _bool_payload(payload, "saveSampleFrames"),
         "batch_same_evidence_spans": _bool_payload(payload, "batchSameEvidenceSpans", True),
         "skip_evidence_above_threshold": _bool_payload(payload, "skipEvidenceAboveThreshold", True),
@@ -864,6 +886,7 @@ def get_benchmark_run_events(request: HttpRequest, run_id: str, benchmark_id: st
 
 def _benchmark_response(benchmark: dict[str, Any]) -> dict[str, Any]:
     out = dict(benchmark)
+    out.setdefault("max_qa_pairs_per_video", -1)
     out.pop("run_dir", None)
     runs = _all_benchmark_runs(str(benchmark.get("id") or "")) if not bool(benchmark.get("legacy", False)) else list(benchmark.get("runs") or [])
     out["runs"] = [_benchmark_run_response(benchmark, run) for run in runs if isinstance(run, dict)]
@@ -1187,10 +1210,17 @@ def _execute_benchmark(run: dict[str, Any], cancel_event: threading.Event, resum
     litellm = _import_required("litellm", "LiteLLM is required for LM Studio benchmark calls.")
     run_id = str(run.get("id") or "")
     questions = _load_all_questions(list(run.get("qa_files") or []))
-    total = len(questions)
     batch_same_evidence_spans = bool(run.get("batch_same_evidence_spans", True))
     skip_evidence_above_threshold = bool(run.get("skip_evidence_above_threshold", True))
     evidence_duration_threshold = float(run.get("evidence_duration_threshold_seconds") or 25)
+    max_qa_pairs_per_video = int(run.get("max_qa_pairs_per_video", -1))
+    questions = _limit_qa_pairs_per_file(
+        questions,
+        max_qa_pairs_per_video,
+        skip_evidence_above_threshold=skip_evidence_above_threshold,
+        evidence_duration_threshold=evidence_duration_threshold,
+    )
+    total = len(questions)
     results_path = _results_path_for_run(run)
     events_path = _events_path_for_run(run)
     completed_qa_keys = (_completed_qa_keys_from_results(results_path) | _completed_qa_keys_from_events(events_path)) if resume and batch_same_evidence_spans else set()
@@ -1349,6 +1379,45 @@ def _load_all_questions(qa_files: list[str]) -> list[dict[str, Any]]:
                 item["_qa_file"] = rel_path
                 items.append(item)
     return items
+
+
+def _limit_qa_pairs_per_file(
+    questions: list[dict[str, Any]],
+    maximum: int,
+    *,
+    skip_evidence_above_threshold: bool,
+    evidence_duration_threshold: float,
+) -> list[dict[str, Any]]:
+    """Cap model-evaluated QA pairs independently per selected QA file.
+
+    Evidence pairs that will already be skipped do not consume the allowance.
+    Keeping those rows in the returned sequence preserves existing skip events
+    and progress behavior for questions encountered before the cap is reached.
+    """
+    if maximum == -1:
+        return questions
+
+    selected: list[dict[str, Any]] = []
+    evaluated_by_file: dict[str, int] = {}
+    exhausted_files: set[str] = set()
+    for item in questions:
+        qa_file = str(item.get("_qa_file") or "")
+        if qa_file in exhausted_files:
+            continue
+        if skip_evidence_above_threshold and _qa_pair_exceeds_evidence_threshold(item, evidence_duration_threshold):
+            selected.append(item)
+            continue
+
+        evaluated = evaluated_by_file.get(qa_file, 0)
+        if evaluated >= maximum:
+            exhausted_files.add(qa_file)
+            continue
+        selected.append(item)
+        evaluated += 1
+        evaluated_by_file[qa_file] = evaluated
+        if evaluated >= maximum:
+            exhausted_files.add(qa_file)
+    return selected
 
 
 def _qa_pair_key(item: dict[str, Any]) -> str:
@@ -1594,18 +1663,30 @@ def _request_model_completion(litellm: Any, run: dict[str, Any], items: list[dic
 
 def _complete_answer(litellm: Any, run: dict[str, Any], item: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, str]:
     model = str(run.get("model") or "").strip()
-    response = _request_model_completion(litellm, run, [item], messages, MAX_TOKENS)
-    raw_answer = _completion_text(response)
-    parsed = _parse_model_answer(raw_answer)
-    correct = _score_answer(item, parsed)
-    return _benchmark_result_row(item, model, raw_answer, parsed, correct)
+    for max_tokens in (MAX_TOKENS, 512, 1024):
+        response = _request_model_completion(litellm, run, [item], messages, max_tokens)
+        raw_answer = _completion_text(response)
+        parsed = _parse_model_answer(raw_answer)
+        if parsed.get("unanswerable") or _answer_text(parsed.get("answer")).strip():
+            correct = _score_answer(item, parsed)
+            return _benchmark_result_row(item, model, raw_answer, parsed, correct)
+        _append_execution_event(run, "question_response_retry", "Model response contained no answer; retrying with a larger output limit.", qaId=str(item.get("id") or item.get("qa_id") or ""), maxTokens=max_tokens)
+    raise RuntimeError(f"Model did not answer QA pair {item.get('id') or item.get('qa_id') or '<unknown>'}.")
 
 
 def _complete_answers_batch(litellm: Any, run: dict[str, Any], items: list[dict[str, Any]], messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     model = str(run.get("model") or "").strip()
     response = _request_model_completion(litellm, run, items, messages, max(MAX_TOKENS, 400 * len(items)))
     raw_answer = _completion_text(response)
-    parsed_answers = _parse_model_answers_batch(raw_answer, items)
+    try:
+        parsed_answers = _parse_model_answers_batch(raw_answer, items)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        _append_execution_event(run, "question_batch_fallback", "Batched response was incomplete; asking each question separately.", qaIds=[str(item.get("id") or item.get("qa_id") or "") for item in items], error=str(exc))
+        shared_images = list(messages[0].get("content") or [])[1:]
+        return [
+            _complete_answer(litellm, run, item, [{"role": "user", "content": _prompt_content(item, []) + shared_images}])
+            for item in items
+        ]
     rows: list[dict[str, str]] = []
     for item in items:
         qa_id = str(item.get("id") or item.get("qa_id") or "")
@@ -1695,7 +1776,7 @@ def _sample_evidence_frames(cv2: Any, video_path: Path, item: dict[str, Any], fr
 
 
 def _limited_frame_indices(indices: list[int]) -> list[int]:
-    if len(indices) <= MAX_EVIDENCE_FRAMES:
+    if MAX_EVIDENCE_FRAMES == -1 or len(indices) <= MAX_EVIDENCE_FRAMES:
         return indices
     if MAX_EVIDENCE_FRAMES == 1:
         return [indices[len(indices) // 2]]
@@ -1770,16 +1851,59 @@ def _batch_prompt_content(items: list[dict[str, Any]], frame_paths: list[Path]) 
     return content
 
 
+def _model_json_objects(text: str):
+    """Read separate JSON objects without merging repeated/fenced responses."""
+    decoder = json.JSONDecoder()
+    offset = 0
+    while (start := text.find("{", offset)) != -1:
+        try:
+            payload, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            # Some LM Studio responses omit only the final closing delimiter.
+            # Accept that narrow case, but never invent an answer or a value.
+            unfinished = text[start:].strip().removesuffix("```").strip()
+            stack: list[str] = []
+            quoted = escaped = invalid = False
+            for char in unfinished:
+                if quoted:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        quoted = False
+                elif char == '"':
+                    quoted = True
+                elif char in "{[":
+                    stack.append("}" if char == "{" else "]")
+                elif char in "}]":
+                    if not stack or stack.pop() != char:
+                        invalid = True
+                        break
+            if not invalid and not quoted and stack:
+                try:
+                    repaired = json.loads(unfinished + "".join(reversed(stack)))
+                    if isinstance(repaired, dict):
+                        yield repaired
+                        break
+                except json.JSONDecodeError:
+                    pass
+            offset = start + 1
+            continue
+        offset = end
+        if isinstance(payload, dict):
+            yield payload
+
+
 def _parse_model_answer(raw: str) -> dict[str, Any]:
     text = raw.strip()
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    if match:
-        try:
-            payload = json.loads(match.group(0))
-            if isinstance(payload, dict):
-                return {"answer": payload.get("answer"), "unanswerable": bool(payload.get("unanswerable", False))}
-        except Exception:
-            pass
+    for payload in _model_json_objects(text):
+        if isinstance(payload.get("json"), dict):
+            payload = payload["json"]
+        if "answer" in payload or "unanswerable" in payload:
+            return {"answer": payload.get("answer"), "unanswerable": bool(payload.get("unanswerable", False))}
+    if text.startswith(("{", "```json")):
+        return {"answer": None, "unanswerable": False}
     lowered = text.lower()
     if "unanswerable" in lowered or "cannot determine" in lowered or "not enough evidence" in lowered:
         return {"answer": None, "unanswerable": True}
@@ -1792,11 +1916,8 @@ def _parse_model_answer(raw: str) -> dict[str, Any]:
 
 def _parse_model_answers_batch(raw: str, items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     text = raw.strip()
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    if not match:
-        raise RuntimeError("Batched model response did not contain a JSON object.")
-    payload = json.loads(match.group(0))
-    if not isinstance(payload, dict) or not isinstance(payload.get("answers"), list):
+    payload = next((value for value in _model_json_objects(text) if isinstance(value.get("answers"), list)), None)
+    if payload is None:
         raise RuntimeError("Batched model response must contain an answers list.")
     expected_ids = {str(item.get("id") or item.get("qa_id") or "") for item in items}
     parsed: dict[str, dict[str, Any]] = {}
@@ -1807,6 +1928,10 @@ def _parse_model_answers_batch(raw: str, items: list[dict[str, Any]]) -> dict[st
         if qa_id not in expected_ids:
             continue
         parsed[qa_id] = {"answer": answer_item.get("answer"), "unanswerable": bool(answer_item.get("unanswerable", False))}
+    if set(parsed) != expected_ids:
+        raise RuntimeError("Batched model response did not include every QA pair.")
+    if any(not answer["unanswerable"] and not _answer_text(answer["answer"]).strip() for answer in parsed.values()):
+        raise RuntimeError("Batched model response contained an empty answer.")
     return parsed
 
 

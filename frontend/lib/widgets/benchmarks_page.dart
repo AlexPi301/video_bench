@@ -108,7 +108,7 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
           const SizedBox(height: 8),
           Text(benchmark.description.isEmpty ? 'No description.' : benchmark.description),
           const SizedBox(height: 12),
-          Wrap(spacing: 10, runSpacing: 10, children: [_InfoChip(label: 'Frame sample rate', value: '${benchmark.frameSampleRate}'), _InfoChip(label: 'Batch spans', value: benchmark.batchSameEvidenceSpans ? 'yes' : 'no'), _InfoChip(label: 'Evidence threshold', value: benchmark.skipEvidenceAboveThreshold ? '${benchmark.evidenceDurationThresholdSeconds}s' : 'off'), _InfoChip(label: 'QA files', value: '${benchmark.qaFiles.length}')]),
+          Wrap(spacing: 10, runSpacing: 10, children: [_InfoChip(label: 'Frame sample rate', value: '${benchmark.frameSampleRate}'), _InfoChip(label: 'Max QA pairs per video', value: benchmark.maxQaPairsPerVideo == -1 ? 'unlimited' : '${benchmark.maxQaPairsPerVideo}'), _InfoChip(label: 'Batch spans', value: benchmark.batchSameEvidenceSpans ? 'yes' : 'no'), _InfoChip(label: 'Evidence threshold', value: benchmark.skipEvidenceAboveThreshold ? '${benchmark.evidenceDurationThresholdSeconds}s' : 'off'), _InfoChip(label: 'QA files', value: '${benchmark.qaFiles.length}')]),
           const SizedBox(height: 14),
           Text('Benchmark runs', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
@@ -142,7 +142,7 @@ class _BenchmarksPageState extends State<BenchmarksPage> {
 
   Widget _buildRunList(Benchmark benchmark) {
     if (benchmark.runs.isEmpty) return const Center(child: Text('No benchmark runs yet.'));
-    return ListView.separated(scrollDirection: Axis.horizontal, itemCount: benchmark.runs.length, separatorBuilder: (_, __) => const SizedBox(width: 8), itemBuilder: (context, index) { final run = benchmark.runs[index]; final selected = run.selectionKey == _run?.selectionKey; return SizedBox(width: 280, child: Card.filled(color: selected ? Theme.of(context).colorScheme.primaryContainer : null, child: ListTile(selected: selected, title: Text(run.model, maxLines: 1, overflow: TextOverflow.ellipsis), subtitle: Text('${run.status} - ${run.isRunning ? '${run.progress.percent}%' : '${run.metrics.total.percent.toStringAsFixed(1)}%'}'), onTap: () => _selectRun(run)))); });
+    return ListView.separated(scrollDirection: Axis.horizontal, itemCount: benchmark.runs.length, separatorBuilder: (_, __) => const SizedBox(width: 8), itemBuilder: (context, index) { final run = benchmark.runs[index]; final selected = run.selectionKey == _run?.selectionKey; return SizedBox(width: 280, child: Card.filled(color: selected ? Theme.of(context).colorScheme.primaryContainer : null, child: ListTile(selected: selected, selectedColor: Theme.of(context).colorScheme.onPrimaryContainer, title: Text(run.model, maxLines: 1, overflow: TextOverflow.ellipsis), subtitle: Text('${run.status} - ${run.isRunning ? '${run.progress.percent}%' : '${run.metrics.total.percent.toStringAsFixed(1)}%'}'), onTap: () => _selectRun(run)))); });
   }
 
   Future<void> _refresh() async {
@@ -204,6 +204,7 @@ class _BenchmarkDialogState extends State<_BenchmarkDialog> {
   late final TextEditingController _description;
   late final TextEditingController _lmStudioUrl;
   late final TextEditingController _frameSampleRate;
+  late final TextEditingController _maxQaPairsPerVideo;
   late final TextEditingController _threshold;
   late final TextEditingController _outputFolder;
   late final TextEditingController _qaFiles;
@@ -223,6 +224,7 @@ class _BenchmarkDialogState extends State<_BenchmarkDialog> {
     _description = TextEditingController(text: b?.description ?? '');
     _lmStudioUrl = TextEditingController(text: b?.lmStudioUrl ?? 'http://host.docker.internal:1234/v1');
     _frameSampleRate = TextEditingController(text: b == null ? '15' : '${b.frameSampleRate}');
+    _maxQaPairsPerVideo = TextEditingController(text: b == null ? '-1' : '${b.maxQaPairsPerVideo}');
     _threshold = TextEditingController(text: b == null ? '25' : '${b.evidenceDurationThresholdSeconds}');
     _outputFolder = TextEditingController(text: b?.outputFolder ?? 'benchmark_runs');
     _qaFiles = TextEditingController(text: _selectedQaFiles.join('\n'));
@@ -239,6 +241,7 @@ class _BenchmarkDialogState extends State<_BenchmarkDialog> {
     _description.dispose();
     _lmStudioUrl.dispose();
     _frameSampleRate.dispose();
+    _maxQaPairsPerVideo.dispose();
     _threshold.dispose();
     _outputFolder.dispose();
     _qaFiles.dispose();
@@ -275,6 +278,9 @@ class _BenchmarkDialogState extends State<_BenchmarkDialog> {
                     _field(_lmStudioUrl, 'LM Studio URL'),
                     const SizedBox(height: 12),
                     _field(_frameSampleRate, 'Frame Sample Rate', keyboardType: TextInputType.number),
+                    const SizedBox(height: 12),
+                    _field(_maxQaPairsPerVideo, 'Max QA pairs per Video', keyboardType: TextInputType.number),
+                    const Align(alignment: Alignment.centerLeft, child: Text('-1 means unlimited. The limit applies separately to each selected QA file; evidence-threshold skips do not use this allowance.')),
                     SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Save sample frames'), value: _saveFrames, onChanged: (value) => setState(() => _saveFrames = value)),
                     SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Batch process QA Pairs with same evidence spans'), value: _batch, onChanged: (value) => setState(() => _batch = value)),
                     SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('skip QA pairs with evidence span above threshold'), value: _skipThreshold, onChanged: (value) => setState(() => _skipThreshold = value)),
@@ -322,12 +328,13 @@ class _BenchmarkDialogState extends State<_BenchmarkDialog> {
 
   void _submit() {
     final frameSampleRate = int.tryParse(_frameSampleRate.text.trim());
+    final maxQaPairsPerVideo = int.tryParse(_maxQaPairsPerVideo.text.trim());
     final threshold = double.tryParse(_threshold.text.trim());
-    if (_name.text.trim().isEmpty || frameSampleRate == null || frameSampleRate < 1 || _selectedQaFiles.isEmpty || (_skipThreshold && (threshold == null || threshold <= 0))) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Name, positive numeric values, and QA files are required.')));
+    if (_name.text.trim().isEmpty || frameSampleRate == null || frameSampleRate < 1 || maxQaPairsPerVideo == null || (maxQaPairsPerVideo != -1 && maxQaPairsPerVideo < 1) || _selectedQaFiles.isEmpty || (_skipThreshold && (threshold == null || threshold <= 0))) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Name, valid numeric values, and QA files are required. Max QA pairs per Video must be -1 or a positive integer.')));
       return;
     }
-    Navigator.of(context).pop(BenchmarkCreateRequest(name: _name.text.trim(), creationDate: _creationDate.text.trim(), runDate: _runDate.text.trim(), description: _description.text.trim(), lmStudioUrl: _lmStudioUrl.text.trim(), frameSampleRate: frameSampleRate, saveSampleFrames: _saveFrames, batchSameEvidenceSpans: _batch, skipEvidenceAboveThreshold: _skipThreshold, evidenceDurationThresholdSeconds: threshold ?? 25, outputFolder: _outputFolder.text.trim().isEmpty ? 'benchmark_runs' : _outputFolder.text.trim(), qaFiles: _selectedQaFiles));
+    Navigator.of(context).pop(BenchmarkCreateRequest(name: _name.text.trim(), creationDate: _creationDate.text.trim(), runDate: _runDate.text.trim(), description: _description.text.trim(), lmStudioUrl: _lmStudioUrl.text.trim(), frameSampleRate: frameSampleRate, maxQaPairsPerVideo: maxQaPairsPerVideo, saveSampleFrames: _saveFrames, batchSameEvidenceSpans: _batch, skipEvidenceAboveThreshold: _skipThreshold, evidenceDurationThresholdSeconds: threshold ?? 25, outputFolder: _outputFolder.text.trim().isEmpty ? 'benchmark_runs' : _outputFolder.text.trim(), qaFiles: _selectedQaFiles));
   }
 }
 
