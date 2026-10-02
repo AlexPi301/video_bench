@@ -211,6 +211,10 @@ The named volume `video-bench-data` persists across container removal. Remove it
 docker volume rm video-bench-data
 ```
 
+## License
+
+Video Bench is licensed under the [MIT License](LICENSE). Third-party dependencies, models, and user-provided media remain subject to their own licenses.
+
 ## Project structure
 
 ```text
@@ -231,5 +235,6 @@ video_bench/
 |   |-- Dockerfile                # Multi-stage production image
 |   |-- nginx.conf
 |   `-- entrypoint.sh
+|-- LICENSE
 `-- README.md
 ```
