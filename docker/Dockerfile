@@ -64,6 +64,8 @@ ARG APP_DIR=.
 
 ARG VIDEO_BENCH_EXPERIMENTAL=false
 
+LABEL org.opencontainers.image.licenses="MIT"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -111,6 +113,7 @@ RUN --mount=type=cache,id=video-bench-pip-cache,target=/root/.cache/pip,sharing=
 # \   && rm -rf /wheels /tmp/requirements.txt
 
 COPY ${APP_DIR}/docker/nginx.conf /etc/nginx/conf.d/default.conf
+COPY ${APP_DIR}/LICENSE /usr/share/doc/video-bench/LICENSE
 COPY ${APP_DIR}/docker/docker-entrypoint.d/40-video-bench-debug-config.sh /docker-entrypoint.d/40-video-bench-debug-config.sh
 COPY ${APP_DIR}/docker/entrypoint.sh /entrypoint.sh
 COPY --chown=app:app ${APP_DIR}/backend/manage.py /app/backend/manage.py
